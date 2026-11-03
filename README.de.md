@@ -4,6 +4,16 @@
 
 # KeyZapper
 
+[![Build](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml)
+[![Release](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml)
+[![Security audit](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml)
+[![Aktuelle Version](https://img.shields.io/github/v/release/bl0rb/ClaudeKeyZapper?display_name=tag&label=release)](https://github.com/bl0rb/ClaudeKeyZapper/releases/latest)
+[![Lizenz: MIT](https://img.shields.io/badge/Lizenz-MIT-blue)](LICENSE)
+[![Plattformen](https://img.shields.io/badge/Plattformen-macOS%2014%2B%20%7C%20Windows%2010%2B-lightgrey)](#voraussetzungen)
+[![Signierte Updates](https://img.shields.io/badge/Updates-minisign--signiert-success)](docs/security-audit.md#updates-and-installers)
+[![Key-Ablage](https://img.shields.io/badge/Keys-lokale%20Datei%20%C2%B7%20nur%20Besitzer%20%C2%B7%20nur%20https-success)](docs/security-audit.md#key-storage)
+[![Sicherheitsreview](https://img.shields.io/badge/Sicherheitsreview-2026--11--03-informational)](docs/security-audit.md)
+
 Desktop-App für macOS und Windows, die freigegebene, projektbezogene LiteLLM-Keys in einer lokalen Key-Datei verwaltet und lokalen Projektordnern zuordnet.
 Claude Code (VS Code, IntelliJ, CLI) verwendet danach in jedem Projekt automatisch den passenden Key. Mehrere gleichzeitig
 offene Projekte arbeiten unabhängig voneinander.
@@ -200,7 +210,7 @@ Die App schreibt in `<Projekt>/.claude/settings.local.json`:
 
 | Schlüssel | Wert |
 |---|---|
-| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` unter macOS, unter Windows der gequotete Pfad von `keyzapper-helper.exe` im Installationsordner (Key- und SSO-Profile) |
+| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` unter macOS, unter Windows der gequotete Pfad von `keyzapper-helper.exe` im Installationsordner (Key- und SSO-Profile); `'/mnt/c/…/keyzapper-helper.exe' credential --profile <UUID>` bei Projekten in WSL |
 | `env.ANTHROPIC_BASE_URL` | LiteLLM-Endpunkt des Profils |
 | `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`, `env.ANTHROPIC_MODEL` | Modellnamen des Gateways aus dem Profil (falls gesetzt), z. B. `eu.anthropic.claude-sonnet-5-…` |
 | weitere `env.*` | Zusätzliche Umgebungsvariablen des Profils, z. B. `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` für Bedrock über LiteLLM |
@@ -229,6 +239,26 @@ nie über Argumente oder Logs.
 | 78 | Metadaten defekt, Endpunkt nicht https (http nur für localhost) oder nicht in `AllowedGatewayHosts` |
 
 Metadaten ohne Keys liegen in `state.json` im App-Datenordner, die Keys daneben in `keys.json`: `~/Library/Application Support/KeyZapper` unter macOS (nur für den Besitzer), `%LOCALAPPDATA%\KeyZapper` unter Windows (Benutzerprofil-Ordner). Keys aus der früheren Schlüsselbund-Version bietet die App unter macOS einmalig zur Übernahme an (macOS fragt dabei ggf. je Key um Erlaubnis).
+
+## Projekte in WSL (Windows)
+
+Ein Projektordner in einer WSL-Distribution (`\\wsl.localhost\<Distro>\home\…`, auch das ältere `\\wsl$\…`) wird wie jeder
+andere Ordner zugeordnet: im Ordnerdialog unter „Linux“ auswählen oder auf das Fenster ziehen. Git-Root, Status und der
+Git-Exclude-Eintrag kommen vom Git der Distribution (`wsl.exe -d <Distro> --exec git …`), nicht von Windows-Git, das auf
+diesen Freigaben „dubious ownership“ meldet.
+
+Claude Code in WSL ist ein Linux-Prozess und führt `apiKeyHelper` mit `/bin/sh` aus; in der `settings.local.json` eines
+solchen Projekts steht deshalb der Windows-Helper über seinen Mount-Pfad, für sh gequotet:
+
+```json
+"apiKeyHelper": "'/mnt/c/Users/<Benutzer>/AppData/Local/Programs/KeyZapper/keyzapper-helper.exe' credential --profile <UUID>"
+```
+
+Der Helper läuft per WSL-Interop als Windows-Prozess und liest `keys.json` wie gewohnt aus `%LOCALAPPDATA%\KeyZapper`;
+der Key gelangt nie ins Dateisystem der Distribution. Voraussetzungen: WSL-Interop und der Laufwerks-Automount müssen
+aktiv sein (Standard; `[interop] enabled=true` und `[automount] enabled=true` mit Standard-Root `/mnt` in `/etc/wsl.conf`),
+und in der Distribution muss git installiert sein, damit die Git-Root erkannt wird (sonst wird der gewählte Ordner selbst
+zugeordnet).
 
 ## Verteilung über Microsoft Intune
 

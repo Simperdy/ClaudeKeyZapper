@@ -17,6 +17,12 @@ pub struct Release {
 fn notes() -> Vec<(&'static str, Vec<String>)> {
     vec![
         (
+            "1.5.5",
+            vec![
+                l!("Projekte in WSL: Ordner unter \\\\wsl.localhost lassen sich zuordnen; Claude Code in WSL holt den Key über den Windows-Helper per WSL-Interop, Git-Root und Status kommen aus der Distribution."),
+            ],
+        ),
+        (
             "1.5.4",
             vec![
                 l!("Claude in Office und Claude Desktop (SSO) lassen sich jetzt auch bei Profilen aus Intune im Profil einschalten, solange die IT sie dort nicht selbst setzt."),

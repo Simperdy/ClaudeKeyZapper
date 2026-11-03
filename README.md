@@ -4,6 +4,16 @@
 
 # KeyZapper
 
+[![Build](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml)
+[![Release](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml)
+[![Security audit](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml)
+[![Latest release](https://img.shields.io/github/v/release/bl0rb/ClaudeKeyZapper?display_name=tag&label=release)](https://github.com/bl0rb/ClaudeKeyZapper/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%2014%2B%20%7C%20Windows%2010%2B-lightgrey)](#requirements)
+[![Signed updates](https://img.shields.io/badge/updates-minisign%20signed-success)](docs/security-audit.md#updates-and-installers)
+[![Key storage](https://img.shields.io/badge/keys-local%20file%20%C2%B7%20owner--only%20%C2%B7%20https%20only-success)](docs/security-audit.md#key-storage)
+[![Security review](https://img.shields.io/badge/security%20review-2026--11--03-informational)](docs/security-audit.md)
+
 Desktop app for macOS and Windows that manages approved, project-specific LiteLLM keys in a local key file and assigns them to local project folders.
 Claude Code (VS Code, IntelliJ, CLI) then automatically uses the matching key in every project. Several projects open at
 the same time work independently of each other.
@@ -197,7 +207,7 @@ The app writes to `<project>/.claude/settings.local.json`:
 
 | Key | Value |
 |---|---|
-| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` on macOS, the quoted path of `keyzapper-helper.exe` in the install folder on Windows (Key and SSO profiles) |
+| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` on macOS, the quoted path of `keyzapper-helper.exe` in the install folder on Windows (Key and SSO profiles); `'/mnt/c/…/keyzapper-helper.exe' credential --profile <UUID>` for projects in WSL |
 | `env.ANTHROPIC_BASE_URL` | LiteLLM endpoint of the profile |
 | `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`, `env.ANTHROPIC_MODEL` | Gateway model names of the profile (if set), e.g. `eu.anthropic.claude-sonnet-5-…` |
 | further `env.*` | Additional environment variables of the profile, e.g. `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for Bedrock via LiteLLM |
@@ -226,6 +236,25 @@ never via arguments or logs.
 | 78 | metadata corrupt, endpoint not https (http only for localhost) or not in `AllowedGatewayHosts` |
 
 Metadata without keys is stored in `state.json` in the app data folder, the keys in `keys.json` next to it: `~/Library/Application Support/KeyZapper` on macOS (owner-only), `%LOCALAPPDATA%\KeyZapper` on Windows (user profile folder). Keys from the former Keychain-based version are offered for a one-time move on macOS (macOS may ask for permission once per key).
+
+## Projects in WSL (Windows)
+
+A project folder inside a WSL distribution (`\\wsl.localhost\<distro>\home\…`, also the older `\\wsl$\…`) is assigned like any
+other folder: pick it in the folder dialog under "Linux" or drag it onto the window. Git root, status and the Git exclude
+entry come from the distribution's own git (`wsl.exe -d <distro> --exec git …`), not from Windows git, which reports
+"dubious ownership" on these shares.
+
+Claude Code inside WSL is a Linux process and runs `apiKeyHelper` with `/bin/sh`, so `settings.local.json` in such a
+project contains the Windows helper by its mount path, quoted for sh:
+
+```json
+"apiKeyHelper": "'/mnt/c/Users/<user>/AppData/Local/Programs/KeyZapper/keyzapper-helper.exe' credential --profile <UUID>"
+```
+
+The helper runs through WSL interop as a Windows process and reads `keys.json` from `%LOCALAPPDATA%\KeyZapper` as usual;
+the key never enters the distribution's file system. Requirements: WSL interop and the drive automount must be on (the
+defaults; `[interop] enabled=true` and `[automount] enabled=true` with the default root `/mnt` in `/etc/wsl.conf`), and git
+must be installed in the distribution for the Git root to be detected (otherwise the picked folder itself is assigned).
 
 ## Distribution via Microsoft Intune
 

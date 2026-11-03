@@ -5,3 +5,8 @@ dist/
 desktop/target/
 desktop/node_modules/
 desktop/src-tauri/gen/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

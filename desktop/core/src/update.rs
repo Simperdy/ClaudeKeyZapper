@@ -128,7 +128,8 @@ fn release_info(release: &serde_json::Value) -> Option<ReleaseInfo> {
     Some(ReleaseInfo {
         version: normalized(release["tag_name"].as_str()?),
         prerelease: release["prerelease"].as_bool().unwrap_or(false),
-        page_url: release["html_url"].as_str()?.to_string(),
+        // The release page is opened in the browser: only GitHub's own, like the packages.
+        page_url: release["html_url"].as_str().filter(|u| url::Url::parse(u).is_ok_and(|u| u.scheme() == "https" && u.host_str() == Some("github.com")))?.to_string(),
         package_url: asset.and_then(|a| a["browser_download_url"].as_str()).map(String::from),
         package_sha256: asset
             .and_then(|a| a["digest"].as_str())
@@ -311,6 +312,14 @@ mod tests {
         assert_eq!(release.package_sha256.as_deref(), Some("abc"));
         assert!(release.package_url.unwrap().starts_with("https://github.com/"));
         assert_eq!(release.signature_url, None);
+    }
+
+    #[test]
+    fn release_page_must_be_on_github() {
+        let body = r#"{"tag_name":"1.2.0","html_url":"https://evil.example/releases/1.2.0","assets":[]}"#;
+        assert!(parse(body).is_none());
+        let body = r#"{"tag_name":"1.2.0","html_url":"http://github.com/x/y/releases/1.2.0","assets":[]}"#;
+        assert!(parse(body).is_none());
     }
 
     #[test]

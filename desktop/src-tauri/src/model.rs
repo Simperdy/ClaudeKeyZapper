@@ -429,7 +429,7 @@ impl Model {
         let notice = self.notice.clone();
         for binding in self.state.bindings.clone() {
             let Some(profile) = self.profile(&binding.profile_id) else { continue };
-            let wanted = binder.desired_values(&profile, binding.is_pooled(), binding.models.as_ref());
+            let wanted = binder.desired_values_for(&binding.path, &profile, binding.is_pooled(), binding.models.as_ref());
             if binding.managed_values.get("apiKeyHelper") != wanted.get("apiKeyHelper") && Path::new(&binding.path).is_dir() {
                 self.apply(&profile, &binding.path, Some(&binding), None);
             }
