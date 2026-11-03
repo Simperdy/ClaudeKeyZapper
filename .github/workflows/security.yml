@@ -1,0 +1,28 @@
+name: Security audit
+
+# Checks the Rust dependency tree of the desktop app against the RustSec advisory database.
+on:
+  push:
+    branches: [main]
+    paths: ['desktop/Cargo.lock', 'desktop/**/Cargo.toml', '.github/workflows/security.yml']
+  pull_request:
+    paths: ['desktop/Cargo.lock', 'desktop/**/Cargo.toml', '.github/workflows/security.yml']
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit desktop/Cargo.lock
+        working-directory: desktop
+        run: cargo audit

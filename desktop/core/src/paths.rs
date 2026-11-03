@@ -82,14 +82,24 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::Result<
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".{}.keyzapper-{}", path.file_name().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, data)?;
+    // A private file is created owner-only from the first byte, not chmod'ed after the write: the umask
+    // would leave the key material world-readable for a moment otherwise.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     if private {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
     #[cfg(not(unix))]
     let _ = private;
+    {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(data).and_then(|_| file.sync_all()).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -104,4 +114,22 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_files_are_owner_only_and_replace_existing_ones() {
+        let dir = std::env::temp_dir().join(format!("keyzapper-paths-{}", uuid::Uuid::new_v4()));
+        let file = dir.join("keys.json");
+        write_atomic(&file, b"{}", true).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        write_atomic(&file, b"{\"a\":\"b\"}", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"a\":\"b\"}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

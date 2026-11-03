@@ -4,6 +4,16 @@
 
 # KeyZapper
 
+[![Build](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/desktop.yml)
+[![Release](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/release.yml)
+[![Security audit](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml/badge.svg)](https://github.com/bl0rb/ClaudeKeyZapper/actions/workflows/security.yml)
+[![Aktuelle Version](https://img.shields.io/github/v/release/bl0rb/ClaudeKeyZapper?display_name=tag&label=release)](https://github.com/bl0rb/ClaudeKeyZapper/releases/latest)
+[![Lizenz: MIT](https://img.shields.io/badge/Lizenz-MIT-blue)](LICENSE)
+[![Plattformen](https://img.shields.io/badge/Plattformen-macOS%2014%2B%20%7C%20Windows%2010%2B-lightgrey)](#voraussetzungen)
+[![Signierte Updates](https://img.shields.io/badge/Updates-minisign--signiert-success)](docs/security-audit.md#updates-and-installers)
+[![Key-Ablage](https://img.shields.io/badge/Keys-lokale%20Datei%20%C2%B7%20nur%20Besitzer%20%C2%B7%20nur%20https-success)](docs/security-audit.md#key-storage)
+[![Sicherheitsreview](https://img.shields.io/badge/Sicherheitsreview-2026--11--03-informational)](docs/security-audit.md)
+
 Desktop-App für macOS und Windows, die freigegebene, projektbezogene LiteLLM-Keys in einer lokalen Key-Datei verwaltet und lokalen Projektordnern zuordnet.
 Claude Code (VS Code, IntelliJ, CLI) verwendet danach in jedem Projekt automatisch den passenden Key. Mehrere gleichzeitig
 offene Projekte arbeiten unabhängig voneinander.
