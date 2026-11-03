@@ -67,14 +67,14 @@ pub fn default_user_settings_path() -> String {
 /// (Claude Code ≥ 2.1.288, spike T4/T11/T15), otherwise the folder itself.
 pub fn settings_root(folder: &str) -> String {
     let path = paths::canonical_path(folder);
-    let Some(common) = git::run(&["rev-parse", "--path-format=absolute", "--git-common-dir"], &path) else { return path };
+    let Some(common) = git::run_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"], &path) else { return path };
     let common = PathBuf::from(common);
     if common.file_name().is_some_and(|n| n == ".git") {
         if let Some(parent) = common.parent() {
             return paths::canonical_path(&parent.to_string_lossy());
         }
     }
-    git::run(&["rev-parse", "--show-toplevel"], &path).map(|p| paths::canonical_path(&p)).unwrap_or(path)
+    git::run_path(&["rev-parse", "--show-toplevel"], &path).map(|p| paths::canonical_path(&p)).unwrap_or(path)
 }
 
 /// Quotes the helper path for the shell Claude Code uses for `apiKeyHelper`: `/bin/sh` on macOS, `cmd` on Windows.
@@ -82,8 +82,34 @@ pub fn shell_quote(path: &str) -> String {
     if cfg!(windows) {
         format!("\"{}\"", path.replace('"', ""))
     } else {
-        format!("'{}'", path.replace('\'', "'\\''"))
+        sh_quote(path)
     }
+}
+
+/// Single quotes for `/bin/sh` (macOS, and Claude Code inside WSL).
+pub fn sh_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The helper as the project's Claude Code calls it. A project inside WSL (`\\wsl.localhost\…`) runs Claude Code as a
+/// Linux process: it calls the Windows helper through WSL interop under `/bin/sh`, so the helper's path is given as
+/// `/mnt/<drive>/…` and quoted for sh. The helper then reads `keys.json` from the Windows user's `%LOCALAPPDATA%` as usual.
+pub fn helper_invocation(helper_path: &str, root: &str) -> String {
+    if paths::is_wsl_path(root) {
+        if let Some(linux) = paths::windows_to_wsl_path(helper_path) {
+            return sh_quote(&linux);
+        }
+    }
+    shell_quote(helper_path)
+}
+
+/// A project inside WSL can only use a helper on a drive letter (`/mnt/<drive>`); `apply` refuses other installs
+/// instead of writing a command that `/bin/sh` in WSL cannot run.
+pub fn wsl_helper_conflict(helper_path: &str, root: &str) -> Option<SettingsConflict> {
+    if !paths::is_wsl_path(root) || paths::windows_to_wsl_path(helper_path).is_some() {
+        return None;
+    }
+    Some(SettingsConflict::blocking(l!("KeyZapper ist unter %@ installiert; Claude Code in WSL erreicht den Helper nur auf einem Laufwerk mit Buchstaben (/mnt/…).", helper_path)))
 }
 
 pub fn is_truthy(value: Option<&str>) -> bool {
@@ -148,6 +174,11 @@ impl SettingsBinder {
     /// A `selection` (models of one tenant) replaces the profile's model values; helper and endpoint stay the same.
     /// Subscription profiles have no gateway models, so a selection does not apply to them.
     pub fn desired_values(&self, profile: &Profile, pooled: bool, selection: Option<&ModelSelection>) -> BTreeMap<String, String> {
+        self.desired_values_for("", profile, pooled, selection)
+    }
+
+    /// Like `desired_values`, with the helper command for the project `root` (see `helper_invocation`).
+    pub fn desired_values_for(&self, root: &str, profile: &Profile, pooled: bool, selection: Option<&ModelSelection>) -> BTreeMap<String, String> {
         if profile.is_subscription() {
             return subscription_values(profile);
         }
@@ -155,7 +186,7 @@ impl SettingsBinder {
         let endpoint = profile.endpoint.trim_end_matches('/').to_string();
         let command = if pooled { "pool" } else { "credential" };
         let mut values = BTreeMap::from([
-            ("apiKeyHelper".to_string(), format!("{} {command} --profile {}", shell_quote(&self.helper_path), profile.id)),
+            ("apiKeyHelper".to_string(), format!("{} {command} --profile {}", helper_invocation(&self.helper_path, root), profile.id)),
             ("env.ANTHROPIC_BASE_URL".to_string(), endpoint),
             ("env.ANTHROPIC_API_KEY".to_string(), String::new()),
             ("env.ANTHROPIC_AUTH_TOKEN".to_string(), String::new()),
@@ -188,9 +219,10 @@ impl SettingsBinder {
         if expected != root {
             return Err(Error::NotSettingsRoot { folder: root, root: expected });
         }
-        let desired = self.desired_values(profile, pooled, selection);
+        let desired = self.desired_values_for(&root, profile, pooled, selection);
         let previous_values = previous.map(|p| p.managed_values.clone()).unwrap_or_default();
-        let outer = self.environment_conflicts(&root, &BTreeMap::new());
+        let mut outer = self.environment_conflicts(&root, &BTreeMap::new());
+        outer.extend(wsl_helper_conflict(&self.helper_path, &root));
         let blocking: Vec<_> = outer.iter().filter(|c| c.blocking).cloned().collect();
         if !blocking.is_empty() {
             return Err(Error::SettingsConflicts(blocking));
@@ -351,7 +383,8 @@ impl SettingsBinder {
                 return BindingStatus { health: BindingHealth::Drifted(vec![]), conflicts };
             }
         };
-        BindingStatus { health: health(&settings, &self.desired_values(profile, binding.is_pooled(), binding.models.as_ref())), conflicts }
+        let desired = self.desired_values_for(&binding.path, profile, binding.is_pooled(), binding.models.as_ref());
+        BindingStatus { health: health(&settings, &desired), conflicts }
     }
 
     // MARK: Conflicts
@@ -563,7 +596,7 @@ pub(crate) fn mutate_settings(file: &Path, transform: impl FnMut(&mut Object) ->
 // MARK: Git exclude
 
 fn exclude_file(root: &str) -> Option<PathBuf> {
-    git::run(&["rev-parse", "--path-format=absolute", "--git-common-dir"], root).map(|c| PathBuf::from(c).join("info").join("exclude"))
+    git::run_path(&["rev-parse", "--path-format=absolute", "--git-common-dir"], root).map(|c| PathBuf::from(c).join("info").join("exclude"))
 }
 
 /// Ensures `relative` (e.g. the local settings file) is git-ignored via `<git-common-dir>/info/exclude` (shared

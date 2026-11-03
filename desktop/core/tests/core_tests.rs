@@ -100,6 +100,33 @@ fn helper_command_survives_spaces_and_quotes_in_path() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), format!("ok:{ALPHA}"));
 }
 
+/// A project inside WSL runs Claude Code as a Linux process: the Windows helper is called through WSL interop under
+/// `/bin/sh`, by its `/mnt/<drive>/…` path, quoted for sh. The status check compares against the same command.
+#[test]
+fn wsl_projects_get_the_helper_as_sh_command_on_its_mnt_path() {
+    let b = SettingsBinder { helper_path: r"C:\Users\u\AppData\Local\Programs\Key Zapper\keyzapper-helper.exe".into(), ..binder() };
+    let root = r"\\wsl.localhost\Ubuntu\home\u\my proj";
+    let command = b.desired_values_for(root, &sample(), false, None)["apiKeyHelper"].clone();
+    assert_eq!(command, format!("'/mnt/c/Users/u/AppData/Local/Programs/Key Zapper/keyzapper-helper.exe' credential --profile {ALPHA}"));
+    assert_eq!(b.desired_values_for(r"\\wsl$\Ubuntu\home\u", &sample(), true, None)["apiKeyHelper"], command.replace("credential", "pool"));
+    assert_eq!(settings::helper_invocation(r"C:\x\it's.exe", r"\\wsl$\Ubuntu"), "'/mnt/c/x/it'\\''s.exe'");
+    // Folders outside WSL keep the platform's quoting; the user settings (global default) are never inside WSL.
+    assert_eq!(b.desired_values_for(r"C:\proj", &sample(), false, None)["apiKeyHelper"], b.desired_values(&sample(), false, None)["apiKeyHelper"]);
+    assert_eq!(settings::helper_invocation(r"C:\x\keyzapper-helper.exe", r"C:\proj"), settings::shell_quote(r"C:\x\keyzapper-helper.exe"));
+}
+
+/// A helper that WSL cannot reach through `/mnt/<drive>` (e.g. installed on a network share) blocks a WSL project
+/// instead of being written as a command `/bin/sh` cannot run; folders outside WSL are unaffected.
+#[test]
+fn wsl_projects_refuse_a_helper_outside_a_drive_letter() {
+    let conflict = settings::wsl_helper_conflict(r"\\srv\apps\KeyZapper\keyzapper-helper.exe", r"\\wsl.localhost\Ubuntu\home\u\proj").unwrap();
+    assert!(conflict.blocking && conflict.message.contains("/mnt/"));
+    assert!(settings::wsl_helper_conflict(r"C:\Programs\KeyZapper\keyzapper-helper.exe", r"\\wsl.localhost\Ubuntu\home\u\proj").is_none());
+    assert!(settings::wsl_helper_conflict(r"\\srv\apps\KeyZapper\keyzapper-helper.exe", r"C:\proj").is_none());
+    let b = SettingsBinder { helper_path: r"\\srv\apps\KeyZapper\keyzapper-helper.exe".into(), ..binder() };
+    assert!(b.apply(&sample(), &temp_dir("proj"), None, false, None).is_ok());
+}
+
 /// Claude Code runs `apiKeyHelper` through `cmd /d /s /c` on Windows.
 #[cfg(windows)]
 #[test]

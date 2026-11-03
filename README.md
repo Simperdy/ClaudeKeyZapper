@@ -207,7 +207,7 @@ The app writes to `<project>/.claude/settings.local.json`:
 
 | Key | Value |
 |---|---|
-| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` on macOS, the quoted path of `keyzapper-helper.exe` in the install folder on Windows (Key and SSO profiles) |
+| `apiKeyHelper` | `'/Applications/KeyZapper.app/Contents/MacOS/keyzapper-helper' credential --profile <UUID>` on macOS, the quoted path of `keyzapper-helper.exe` in the install folder on Windows (Key and SSO profiles); `'/mnt/c/…/keyzapper-helper.exe' credential --profile <UUID>` for projects in WSL |
 | `env.ANTHROPIC_BASE_URL` | LiteLLM endpoint of the profile |
 | `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`, `env.ANTHROPIC_MODEL` | Gateway model names of the profile (if set), e.g. `eu.anthropic.claude-sonnet-5-…` |
 | further `env.*` | Additional environment variables of the profile, e.g. `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for Bedrock via LiteLLM |
@@ -236,6 +236,25 @@ never via arguments or logs.
 | 78 | metadata corrupt, endpoint not https (http only for localhost) or not in `AllowedGatewayHosts` |
 
 Metadata without keys is stored in `state.json` in the app data folder, the keys in `keys.json` next to it: `~/Library/Application Support/KeyZapper` on macOS (owner-only), `%LOCALAPPDATA%\KeyZapper` on Windows (user profile folder). Keys from the former Keychain-based version are offered for a one-time move on macOS (macOS may ask for permission once per key).
+
+## Projects in WSL (Windows)
+
+A project folder inside a WSL distribution (`\\wsl.localhost\<distro>\home\…`, also the older `\\wsl$\…`) is assigned like any
+other folder: pick it in the folder dialog under "Linux" or drag it onto the window. Git root, status and the Git exclude
+entry come from the distribution's own git (`wsl.exe -d <distro> --exec git …`), not from Windows git, which reports
+"dubious ownership" on these shares.
+
+Claude Code inside WSL is a Linux process and runs `apiKeyHelper` with `/bin/sh`, so `settings.local.json` in such a
+project contains the Windows helper by its mount path, quoted for sh:
+
+```json
+"apiKeyHelper": "'/mnt/c/Users/<user>/AppData/Local/Programs/KeyZapper/keyzapper-helper.exe' credential --profile <UUID>"
+```
+
+The helper runs through WSL interop as a Windows process and reads `keys.json` from `%LOCALAPPDATA%\KeyZapper` as usual;
+the key never enters the distribution's file system. Requirements: WSL interop and the drive automount must be on (the
+defaults; `[interop] enabled=true` and `[automount] enabled=true` with the default root `/mnt` in `/etc/wsl.conf`), and git
+must be installed in the distribution for the Git root to be detected (otherwise the picked folder itself is assigned).
 
 ## Distribution via Microsoft Intune
 
