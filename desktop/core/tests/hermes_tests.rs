@@ -78,6 +78,11 @@ fn fake_cli(root: &Path, script: &str) -> HermesTarget {
 
 const ALPHA: &str = "123E4567-E89B-12D3-A456-426614174000";
 const BETA: &str = "123E4567-E89B-12D3-A456-426614174001";
+// Synthetic paths for in-memory transport tests, not native Windows support evidence.
+#[cfg(windows)]
+const HELPER: &str = r"C:\KeyZapper\keyzapper-helper";
+#[cfg(not(windows))]
+const HELPER: &str = "/opt/keyzapper-helper";
 fn profile(id: &str) -> Profile { Profile::new(id.into(), "Work".into(), "https://gw.example.test".into(), "team/sonnet".into()) }
 fn selection(id: &str) -> HermesSelection { HermesSelection { target: HermesTarget { executable: "/usr/bin/hermes".into(), home: "/tmp/hermes-home".into(), display_name: "Hermes".into() }, profile_id: id.into(), model_id: "team/sonnet".into(), tenant: Some("team".into()) } }
 fn current_digest(cli: &FakeConfig, target: &HermesTarget) -> String { cli.snapshot(target, &[]).unwrap().config_digest }
@@ -103,12 +108,12 @@ impl Fixture {
 fn lifecycle_connect_is_idempotent_and_disconnect_restores_only_managed_fields() {
     let fx = Fixture::new();
     let s = fx.selection("team/sonnet");
-    connect(&fx.cli, &fx.store, s.clone(), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, s.clone(), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     assert!(*fx.cli.backup_seen_before_write.borrow());
     let connected = fx.cli.all_stored();
     assert_eq!(connected["providers.foreign"], json!({"base_url":"https://foreign.example.test"}));
     assert_eq!(inspect(&fx.cli, &fx.store, &fx.target).unwrap(), BindingHealth::Configured);
-    connect(&fx.cli, &fx.store, s, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, s, &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(fx.cli.all_stored(), connected);
     disconnect(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(fx.cli.all_stored(), BTreeMap::from([("providers.foreign".into(), json!({"base_url":"https://foreign.example.test"}))]));
@@ -122,7 +127,7 @@ fn lifecycle_failed_activation_restores_only_completed_owned_writes() {
     let fx = Fixture::new();
     fx.cli.fail_write_number(2);
     let before = fx.cli.all_stored();
-    assert!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).is_err());
+    assert!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).is_err());
     assert_eq!(fx.cli.all_stored(), before);
     assert!(!fx.store.has_pending_operation().unwrap());
     fs::remove_dir_all(fx.root).unwrap();
@@ -133,10 +138,10 @@ fn lifecycle_update_keeps_first_original_and_detects_user_drift_before_disconnec
     let fx = Fixture::new();
     let mut first = fx.selection("team/model-one");
     first.model_id = "team/model-one".into();
-    connect(&fx.cli, &fx.store, first, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, first, &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let mut second = fx.selection("team/model-two");
     second.model_id = "team/model-two".into();
-    connect(&fx.cli, &fx.store, second, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, second, &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(inspect(&fx.cli, &fx.store, &fx.target).unwrap(), BindingHealth::Configured);
     fx.cli.values.borrow_mut().insert("model.default".into(), json!("user-choice"));
     assert_eq!(inspect(&fx.cli, &fx.store, &fx.target).unwrap(), BindingHealth::Drifted);
@@ -150,8 +155,8 @@ fn lifecycle_update_keeps_first_original_and_detects_user_drift_before_disconnec
 fn lifecycle_records_initial_values_even_when_some_already_match() {
     let fx = Fixture::new();
     fx.cli.values.borrow_mut().insert("model.provider".into(), json!("keyzapper"));
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     disconnect(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(fx.cli.all_stored(), BTreeMap::from([
         ("providers.foreign".into(), json!({"base_url":"https://foreign.example.test"})),
@@ -168,7 +173,7 @@ fn lifecycle_journal_save_failure_happens_before_first_config_write() {
     // A registry that cannot be read must block the operation before any config write.
     fs::create_dir_all(fx.root.join("private-store")).unwrap();
     fs::write(fx.root.join("private-store/registry.json"), b"not json").unwrap();
-    assert!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).is_err());
+    assert!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).is_err());
     assert_eq!(fx.cli.all_stored(), before);
     assert_eq!(fs::read(fx.root.join("private-store/registry.json")).unwrap(), b"not json");
     assert!(!fx.cli.calls.borrow().iter().any(|call| call.starts_with("write:")));
@@ -179,10 +184,10 @@ fn lifecycle_stale_confirmation_rejects_connect_and_disconnect_without_writes() 
     let fx = Fixture::new();
     let stale = "not-the-preview-digest";
     let before = fx.cli.all_stored();
-    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), stale), Err(HermesError::Conflict));
+    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), stale), Err(HermesError::Conflict));
     assert_eq!(fx.cli.all_stored(), before);
     assert!(!fx.store.has_pending_operation().unwrap());
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let before = fx.cli.all_stored();
     assert_eq!(disconnect(&fx.cli, &fx.store, &fx.target, stale), Err(HermesError::Conflict));
     assert_eq!(fx.cli.all_stored(), before);
@@ -191,10 +196,10 @@ fn lifecycle_stale_confirmation_rejects_connect_and_disconnect_without_writes() 
 #[test]
 fn lifecycle_recovery_rolls_back_crash_after_config_write_before_progress_save() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap().unwrap();
-    let plan = plan_connect(&fx.cli, fx.selection("team/model-next"), &profile(ALPHA), "/opt/keyzapper-helper", Some(&owner), &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&fx.cli, fx.selection("team/model-next"), &profile(ALPHA), HELPER, Some(&owner), &ManagedConfig::default()).unwrap();
     fx.store.save_raw_backup(&fx.target, &fx.cli.bytes()).unwrap();
     let first = plan.changes.first().unwrap().clone();
     fx.cli.write(&fx.target, &first.key, match &first.after { StoredValue::Present(v) => Some(v), StoredValue::Absent => None }).unwrap();
@@ -208,10 +213,10 @@ fn lifecycle_recovery_rolls_back_crash_after_config_write_before_progress_save()
 #[test]
 fn lifecycle_recovery_never_overwrites_a_third_user_value() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap().unwrap();
-    let plan = plan_connect(&fx.cli, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", Some(&owner), &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&fx.cli, fx.selection("team/next"), &profile(ALPHA), HELPER, Some(&owner), &ManagedConfig::default()).unwrap();
     let field = plan.changes[0].key.clone();
     fx.store.save_raw_backup(&fx.target, &fx.cli.bytes()).unwrap();
     fx.store.save_journal(&key, &keyzapper_core::hermes::store::Journal { plan, completed: Vec::new(), phase: keyzapper_core::hermes::store::Phase::Applying, operation: keyzapper_core::hermes::store::Operation::Connect }).unwrap();
@@ -229,7 +234,7 @@ fn lifecycle_recovery_never_overwrites_a_third_user_value() {
 #[test]
 fn lifecycle_recovery_rolls_back_interrupted_disconnect_to_configured_owner() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/sonnet"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap().unwrap();
     let keys = owner.last_written.keys().cloned().collect::<Vec<_>>();
@@ -247,10 +252,10 @@ fn lifecycle_recovery_rolls_back_interrupted_disconnect_to_configured_owner() {
 }
 
 fn pending_update(fx: &Fixture) -> (String, keyzapper_core::hermes::Ownership) {
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap().unwrap();
-    let plan = plan_connect(&fx.cli, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", Some(&owner), &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&fx.cli, fx.selection("team/next"), &profile(ALPHA), HELPER, Some(&owner), &ManagedConfig::default()).unwrap();
     fx.store.save_raw_backup(&fx.target, &fx.cli.raw_config(&fx.target).unwrap().unwrap()).unwrap();
     fx.store.save_journal(&key, &keyzapper_core::hermes::store::Journal { plan: plan.clone(), completed: vec![], phase: keyzapper_core::hermes::store::Phase::Applying, operation: keyzapper_core::hermes::store::Operation::Connect }).unwrap();
     for change in &plan.changes { fx.cli.write(&fx.target, &change.key, match &change.after { StoredValue::Present(v) => Some(v), StoredValue::Absent => None }).unwrap(); }
@@ -272,11 +277,11 @@ fn lifecycle_recovery_rollback_write_failure_retains_original_owner_and_backup()
 #[test]
 fn lifecycle_concurrent_edit_to_unchanged_managed_field_is_not_committed() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap();
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|cli, _| { cli.values.borrow_mut().insert("model.provider".into(), json!("user-provider")); }));
-    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::CliFailed));
+    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::CliFailed));
     assert_eq!(fx.cli.all_stored()["model.provider"], json!("user-provider"));
     assert_eq!(fx.cli.all_stored()["model.default"], json!("team/first"));
     assert!(fx.store.owner(&key).unwrap() == owner);
@@ -342,14 +347,14 @@ fn lifecycle_confirmation_checks_actual_entire_raw_config_for_every_action() {
     for action in ["connect", "disconnect", "recover"] {
         let fx = Fixture::new();
         if action == "recover" { pending_update(&fx); }
-        else if action == "disconnect" { connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap(); }
+        else if action == "disconnect" { connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap(); }
         let bytes = fx.cli.raw_config(&fx.target).unwrap().unwrap();
         let mut raw: Value = serde_json::from_slice(&bytes).unwrap();
         raw["unrelated-editor-setting"] = json!(true);
         let access = RawView { cli: &fx.cli, raw: Some(serde_json::to_vec(&raw).unwrap()), digest: None };
         let writes = *fx.cli.write_count.borrow();
         let result = match action {
-            "connect" => connect(&access, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)),
+            "connect" => connect(&access, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)),
             "disconnect" => disconnect(&access, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)),
             _ => recover(&access, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target), keyzapper_core::hermes::RecoveryAction::Rollback),
         };
@@ -378,7 +383,7 @@ fn lifecycle_missing_config_is_not_created_or_replaced_with_a_default() {
     let empty_digest = format!("{:x}", sha2::Sha256::digest([]));
     let access = RawView { cli: &fx.cli, raw: None, digest: Some(empty_digest.clone()) };
     let before = fx.cli.all_stored();
-    assert_eq!(connect(&access, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &empty_digest), Err(HermesError::InvalidConfig));
+    assert_eq!(connect(&access, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &empty_digest), Err(HermesError::InvalidConfig));
     assert_eq!(*fx.cli.write_count.borrow(), 0);
     assert_eq!(fx.cli.all_stored(), before);
     assert!(!fx.store.has_pending_operation().unwrap());
@@ -392,7 +397,7 @@ fn lifecycle_readback_mismatch_never_clobbers_third_value_and_keeps_recovery_fil
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|cli, n| {
         if n == 1 { cli.values.borrow_mut().insert("model.base_url".into(), json!("https://user.example.test")); }
     }));
-    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::RollbackFailed));
+    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::RollbackFailed));
     assert_eq!(*fx.cli.write_count.borrow(), 1);
     assert_eq!(fx.cli.all_stored()["model.base_url"], json!("https://user.example.test"));
     assert!(fx.store.has_pending_operation().unwrap());
@@ -409,7 +414,7 @@ fn lifecycle_deterministic_concurrent_unrelated_edit_survives_connect_and_discon
             cli.values.borrow_mut().insert("display.theme".into(), json!("user-theme"));
         }
     }));
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     disconnect(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(fx.cli.all_stored(), BTreeMap::from([("providers.foreign".into(), json!({"user":"concurrent-provider-edit"})), ("display.theme".into(), json!("user-theme"))]));
     assert!(!fx.store.has_pending_operation().unwrap());
@@ -421,7 +426,7 @@ fn lifecycle_deterministic_managed_edit_before_its_write_is_never_overwritten() 
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|cli, n| {
         if n == 1 { cli.values.borrow_mut().insert("model.default".into(), json!("user-choice")); }
     }));
-    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::RollbackFailed));
+    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::RollbackFailed));
     assert_eq!(*fx.cli.write_count.borrow(), 1);
     assert_eq!(fx.cli.all_stored()["model.default"], json!("user-choice"));
     assert!(fx.store.has_pending_operation().unwrap());
@@ -431,12 +436,12 @@ fn lifecycle_deterministic_managed_edit_before_its_write_is_never_overwritten() 
 #[test]
 fn lifecycle_actual_crash_between_config_write_and_progress_is_recovered_from_current() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let before = fx.cli.all_stored();
     let key = HermesStore::target_key(&fx.target).unwrap();
     let owner = fx.store.owner(&key).unwrap();
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|_, _| panic!("synthetic process interruption after config write")));
-    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target))));
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target))));
     assert!(interrupted.is_err());
     assert_eq!(fx.cli.all_stored()["model.default"], json!("team/next"));
     assert!(fx.store.journal(&key).unwrap().unwrap().completed.is_empty());
@@ -480,10 +485,10 @@ fn lifecycle_moved_helper_repair_replans_explicit_canonical_path_and_keeps_origi
 #[test]
 fn lifecycle_missing_selected_profile_mismatch_never_uses_supplied_default_profile() {
     let fx = Fixture::new();
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let before = fx.cli.all_stored();
     let writes = *fx.cli.write_count.borrow();
-    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(BETA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::PolicyDenied));
+    assert_eq!(connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(BETA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)), Err(HermesError::PolicyDenied));
     assert_eq!(fx.cli.all_stored(), before);
     assert_eq!(*fx.cli.write_count.borrow(), writes);
     assert!(!fx.store.has_pending_operation().unwrap());
@@ -495,8 +500,8 @@ fn lifecycle_disconnect_restores_exact_explicit_model_fields() {
     let fx = Fixture::new();
     for (key, value) in [("model.provider", "original-provider"), ("model.default", "original-model"), ("model.base_url", "https://original.example.test/api")] { fx.cli.values.borrow_mut().insert(key.into(), json!(value)); }
     let before = fx.cli.all_stored();
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
-    connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     disconnect(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)).unwrap();
     assert_eq!(fx.cli.all_stored(), before);
 }
@@ -507,7 +512,7 @@ fn lifecycle_invalid_owner_cannot_authorize_connect_or_disconnect_writes() {
     for action in ["connect", "disconnect"] {
         for case in ["extra-owned-key", "missing-original", "invalid-original", "wrong-owner-target"] {
             let fx = Fixture::new();
-            connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+            connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
             let key = HermesStore::target_key(&fx.target).unwrap();
             let mut owner = fx.store.owner(&key).unwrap().unwrap();
             match case {
@@ -519,7 +524,7 @@ fn lifecycle_invalid_owner_cannot_authorize_connect_or_disconnect_writes() {
             fx.store.save(&BTreeMap::from([(key, owner)])).unwrap();
             let before = fx.cli.all_stored();
             let writes = *fx.cli.write_count.borrow();
-            let result = if action == "connect" { connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)) }
+            let result = if action == "connect" { connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)) }
                 else { disconnect(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target)) };
             if result != Err(HermesError::Conflict) || *fx.cli.write_count.borrow() != writes || fx.cli.all_stored() != before { unsafe_cases.push(format!("{action}/{case}")); }
         }
@@ -531,7 +536,7 @@ fn lifecycle_invalid_owner_cannot_authorize_connect_or_disconnect_writes() {
 fn lifecycle_initial_recovery_cannot_forge_inverse_values_by_editing_snapshot_too() {
     let fx = Fixture::new();
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|_, _| panic!("synthetic first-connect crash")));
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
     *fx.cli.after_write.borrow_mut() = None;
     let key = HermesStore::target_key(&fx.target).unwrap();
     let mut journal = fx.store.journal(&key).unwrap().unwrap();
@@ -564,7 +569,7 @@ fn lifecycle_target_lock_blocks_operation_until_release() {
         let store = HermesStore::new(store_path);
         let mut selected = selection(ALPHA); selected.target = target;
         ready_tx.send(()).unwrap();
-        let result = connect(&cli, &store, selected, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &digest);
+        let result = connect(&cli, &store, selected, &profile(ALPHA), HELPER, &ManagedConfig::default(), &digest);
         done_tx.send(result).unwrap();
     });
     ready_rx.recv().unwrap();
@@ -587,7 +592,7 @@ fn store_concurrent_registry_commits_and_journals_preserve_other_owners() {
     for n in 0..4 {
         let mut target = fx.target.clone(); target.home = fx.root.join(format!("other-home-{n}")); fs::create_dir(&target.home).unwrap();
         let mut selected = selection(ALPHA); selected.target = target.clone(); selected.model_id = format!("team/model-{n}");
-        let plan = plan_connect(&FakeConfig::new(BTreeMap::new()), selected, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+        let plan = plan_connect(&FakeConfig::new(BTreeMap::new()), selected, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
         let owner = keyzapper_core::hermes::binding::ownership_after(&plan, None);
         let key = HermesStore::target_key(&target).unwrap();
         expected.insert(key.clone(), owner.clone());
@@ -619,13 +624,13 @@ fn lifecycle_shared_resource_pending_connect_blocks_other_executable() {
     let other = other_executable(&fx);
     let before = fx.cli.all_stored();
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|_, _| panic!("interrupt A after first config write")));
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
     *fx.cli.after_write.borrow_mut() = None;
     assert!(!fx.cli.all_stored().contains_key("providers.keyzapper"));
     let mut selected = fx.selection("team/first"); selected.target = other.clone();
     let writes = *fx.cli.write_count.borrow();
     assert_eq!(inspect(&fx.cli, &fx.store, &other), Ok(BindingHealth::RecoveryRequired));
-    assert_eq!(connect(&fx.cli, &fx.store, selected, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &other)), Err(HermesError::RecoveryRequired));
+    assert_eq!(connect(&fx.cli, &fx.store, selected, &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &other)), Err(HermesError::RecoveryRequired));
     assert_eq!(*fx.cli.write_count.borrow(), writes);
     recover(&fx.cli, &fx.store, &fx.target, &current_digest(&fx.cli, &fx.target), keyzapper_core::hermes::RecoveryAction::Rollback).unwrap();
     assert_eq!(fx.cli.all_stored(), before);
@@ -636,14 +641,14 @@ fn lifecycle_shared_resource_pending_connect_blocks_other_executable() {
 fn lifecycle_shared_resource_committed_owner_prevents_silent_adoption() {
     let fx = Fixture::new();
     let other = other_executable(&fx);
-    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
     let owner = fx.store.owner(&HermesStore::target_key(&fx.target).unwrap()).unwrap();
     // Even if the provider was manually removed, another binary must not adopt A's config.
     fx.cli.values.borrow_mut().remove("providers.keyzapper");
     let before = fx.cli.all_stored();
     let writes = *fx.cli.write_count.borrow();
     let mut selected = fx.selection("team/first"); selected.target = other.clone();
-    assert_eq!(connect(&fx.cli, &fx.store, selected, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &other)), Err(HermesError::Conflict));
+    assert_eq!(connect(&fx.cli, &fx.store, selected, &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &other)), Err(HermesError::Conflict));
     assert_eq!(fx.cli.all_stored(), before);
     assert_eq!(*fx.cli.write_count.borrow(), writes);
     assert!(fx.store.owner(&HermesStore::target_key(&fx.target).unwrap()).unwrap() == owner);
@@ -654,11 +659,11 @@ fn lifecycle_shared_resource_legacy_overlap_recovery_cannot_clobber_completed_ow
     let fx = Fixture::new();
     let other = other_executable(&fx);
     *fx.cli.after_write.borrow_mut() = Some(Box::new(|_, _| panic!("interrupt A")));
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| connect(&fx.cli, &fx.store, fx.selection("team/first"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)))).is_err());
     *fx.cli.after_write.borrow_mut() = None;
     let mut selected = fx.selection("team/first"); selected.target = other.clone();
     // Reproduce a pre-fix registry: B completed while A was pending, on the same map.
-    let plan = plan_connect(&fx.cli, selected, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&fx.cli, selected, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     for change in &plan.changes { fx.cli.write(&other, &change.key, match &change.after { StoredValue::Present(v) => Some(v), StoredValue::Absent => None }).unwrap(); }
     let owner = keyzapper_core::hermes::binding::ownership_after(&plan, None);
     let key_b = HermesStore::target_key(&other).unwrap();
@@ -705,7 +710,7 @@ fn lifecycle_shared_resource_lock_covers_other_executable_and_home_alias() {
         let mut selected = selection(ALPHA); selected.target = other.clone();
         let digest = FileConfig.snapshot(&other, &[]).unwrap().config_digest;
         ready_tx.send(()).unwrap();
-        done_tx.send(connect(&FileConfig, &HermesStore::new(store_path), selected, &profile(ALPHA), "/opt/keyzapper-helper", &ManagedConfig::default(), &digest)).unwrap();
+        done_tx.send(connect(&FileConfig, &HermesStore::new(store_path), selected, &profile(ALPHA), HELPER, &ManagedConfig::default(), &digest)).unwrap();
     });
     ready_rx.recv().unwrap();
     let blocked = matches!(done_rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout));
@@ -721,24 +726,32 @@ fn lifecycle_shared_resource_lock_covers_other_executable_and_home_alias() {
 #[test]
 fn binding_quotes_helper_and_never_embeds_key_material() {
     let p = profile(ALPHA);
-    let value = desired_provider(&p, "/Applications/AI'Switch.app/Contents/MacOS/keyzapper-helper").unwrap();
+    #[cfg(windows)]
+    let helper = r"C:\Applications\AI'Switch.app\Contents\MacOS\keyzapper-helper";
+    #[cfg(not(windows))]
+    let helper = "/Applications/AI'Switch.app/Contents/MacOS/keyzapper-helper";
+    let value = desired_provider(&p, helper).unwrap();
     assert_eq!(value["api_mode"], "anthropic_messages");
     assert_eq!(value["base_url"], "https://gw.example.test");
-    assert_eq!(value["key_cmd"], "'/Applications/AI'\\''Switch.app/Contents/MacOS/keyzapper-helper' credential --profile 123E4567-E89B-12D3-A456-426614174000 --json");
+    #[cfg(windows)]
+    let expected = "'C:\\Applications\\AI'\\''Switch.app\\Contents\\MacOS\\keyzapper-helper' credential --profile 123E4567-E89B-12D3-A456-426614174000 --json";
+    #[cfg(not(windows))]
+    let expected = "'/Applications/AI'\\''Switch.app/Contents/MacOS/keyzapper-helper' credential --profile 123E4567-E89B-12D3-A456-426614174000 --json";
+    assert_eq!(value["key_cmd"], expected);
     assert_eq!(value.as_object().unwrap().len(), 3);
     assert!(value.get("api_key").is_none());
     let mut sso = profile(BETA); sso.auth_type = AuthType::Oidc;
-    assert_eq!(desired_provider(&sso, "/opt/keyzapper-helper").unwrap()["base_url"], "https://gw.example.test");
+    assert_eq!(desired_provider(&sso, HELPER).unwrap()["base_url"], "https://gw.example.test");
 }
 
 #[test]
 fn binding_accepts_safe_existing_base_url_and_rejects_unsafe_inverse_values() {
     let existing = FakeConfig::new(BTreeMap::from([("model.base_url".into(), json!("https://old.example.test/api"))]));
-    let plan = plan_connect(&existing, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&existing, selection(ALPHA), &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     assert!(matches!(plan.changes.iter().find(|c| c.key == "model.base_url").unwrap().before, StoredValue::Present(ref value) if value == &json!("https://old.example.test/api")));
     for unsafe_url in ["https://user:pass@old.example.test", "https://old.example.test/?token=x", "https://old.example.test/#frag"] {
         let access = FakeConfig::new(BTreeMap::from([("model.base_url".into(), json!(unsafe_url))]));
-        let result = plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default());
+        let result = plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, None, &ManagedConfig::default());
         assert!(matches!(result, Err(HermesError::InvalidConfig)));
         assert!(!access.calls.borrow().iter().any(|call| call.starts_with("write:")));
     }
@@ -749,7 +762,7 @@ fn binding_update_preserves_preexisting_original_and_advances_last_written() {
     let initial_access = FakeConfig::new(BTreeMap::from([("model.default".into(), json!("original-model"))]));
     let mut first_selection = selection(ALPHA);
     first_selection.model_id = "team/model-one".into();
-    let first_plan = plan_connect(&initial_access, first_selection, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let first_plan = plan_connect(&initial_access, first_selection, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     let first_owner = keyzapper_core::hermes::binding::ownership_after(&first_plan, None);
     assert!(matches!(first_owner.original["model.default"], StoredValue::Present(ref v) if v == &json!("original-model")));
     assert!(matches!(first_owner.last_written["model.default"], StoredValue::Present(ref v) if v == &json!("team/model-one")));
@@ -758,7 +771,7 @@ fn binding_update_preserves_preexisting_original_and_advances_last_written() {
     let update_access = FakeConfig::new(std::mem::take(&mut update_values));
     let mut second_selection = selection(ALPHA);
     second_selection.model_id = "team/model-two".into();
-    let update = plan_connect(&update_access, second_selection, &profile(ALPHA), "/opt/keyzapper-helper", Some(&first_owner), &ManagedConfig::default()).unwrap();
+    let update = plan_connect(&update_access, second_selection, &profile(ALPHA), HELPER, Some(&first_owner), &ManagedConfig::default()).unwrap();
     let model_change = update.changes.iter().find(|change| change.key == "model.default").unwrap();
     assert!(matches!(model_change.before, StoredValue::Present(ref value) if value == &json!("team/model-one")));
     assert!(matches!(model_change.after, StoredValue::Present(ref value) if value == &json!("team/model-two")));
@@ -771,14 +784,14 @@ fn binding_update_preserves_preexisting_original_and_advances_last_written() {
 #[test]
 fn binding_rejects_incomplete_or_different_target_ownership_before_snapshot() {
     let access = FakeConfig::new(BTreeMap::new());
-    let initial = plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let initial = plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     let first_owner = keyzapper_core::hermes::binding::ownership_after(&initial, None);
     let mut incomplete = first_owner.clone(); incomplete.last_written.remove("model.default");
-    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", Some(&incomplete), &ManagedConfig::default()), Err(HermesError::Conflict)));
+    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, Some(&incomplete), &ManagedConfig::default()), Err(HermesError::Conflict)));
     let mut other_home = first_owner.clone(); other_home.selection.target.home = "/other/home".into();
-    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", Some(&other_home), &ManagedConfig::default()), Err(HermesError::Conflict)));
+    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, Some(&other_home), &ManagedConfig::default()), Err(HermesError::Conflict)));
     let mut other_executable = first_owner.clone(); other_executable.selection.target.executable = "/other/hermes".into();
-    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", Some(&other_executable), &ManagedConfig::default()), Err(HermesError::Conflict)));
+    assert!(matches!(plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, Some(&other_executable), &ManagedConfig::default()), Err(HermesError::Conflict)));
     assert_eq!(access.calls.borrow().len(), 1, "invalid owners must be rejected before another snapshot");
 }
 
@@ -786,7 +799,7 @@ fn binding_rejects_incomplete_or_different_target_ownership_before_snapshot() {
 fn binding_policy_denial_happens_before_any_write() {
     let access = FakeConfig::new(BTreeMap::new());
     let policy = ManagedConfig::from_values(&serde_json::from_value(json!({"AllowedGatewayHosts":["allowed.example"]})).unwrap());
-    let result = plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &policy);
+    let result = plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, None, &policy);
     assert!(matches!(result, Err(HermesError::PolicyDenied)));
     assert!(!access.calls.borrow().iter().any(|call| call.starts_with("write:")));
     assert!(access.calls.borrow().is_empty());
@@ -795,14 +808,14 @@ fn binding_policy_denial_happens_before_any_write() {
 #[test]
 fn binding_plan_is_idempotent_and_rejects_unowned_provider_collision() {
     let access = FakeConfig::new(BTreeMap::new());
-    let plan = plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     assert_eq!(plan.changes.len(), 4);
     let owned = keyzapper_core::hermes::binding::ownership_after(&plan, None);
     for change in &plan.changes { if let StoredValue::Present(value) = &change.after { access.values.borrow_mut().insert(change.key.clone(), value.clone()); } }
-    let duplicate = plan_connect(&access, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", Some(&owned), &ManagedConfig::default()).unwrap();
+    let duplicate = plan_connect(&access, selection(ALPHA), &profile(ALPHA), HELPER, Some(&owned), &ManagedConfig::default()).unwrap();
     assert!(duplicate.changes.is_empty());
     let collision = FakeConfig::new(BTreeMap::from([("providers.keyzapper".into(), json!({"base_url":"https://other.test","api_mode":"anthropic_messages","key_cmd":"/secret"}))]));
-    assert!(matches!(plan_connect(&collision, selection(ALPHA), &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).err(), Some(HermesError::Collision)));
+    assert!(matches!(plan_connect(&collision, selection(ALPHA), &profile(ALPHA), HELPER, None, &ManagedConfig::default()).err(), Some(HermesError::Collision)));
     assert_eq!(collision.calls.borrow().len(), 1);
 }
 
@@ -860,8 +873,8 @@ fn store_registry_isolates_owners_by_canonical_home_and_executable() {
     let target_b = HermesTarget { executable: exe_b.clone(), home: home_b.clone(), display_name: "B".into() };
     let mut selected_a = selection(ALPHA); selected_a.target = target_a.clone(); selected_a.model_id = "owner-a".into(); selected_a.tenant = None;
     let mut selected_b = selection(BETA); selected_b.target = target_b.clone(); selected_b.model_id = "owner-b".into(); selected_b.tenant = None;
-    let plan_a = plan_connect(&FakeConfig::new(BTreeMap::new()), selected_a, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
-    let plan_b = plan_connect(&FakeConfig::new(BTreeMap::new()), selected_b, &profile(BETA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan_a = plan_connect(&FakeConfig::new(BTreeMap::new()), selected_a, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
+    let plan_b = plan_connect(&FakeConfig::new(BTreeMap::new()), selected_b, &profile(BETA), HELPER, None, &ManagedConfig::default()).unwrap();
     let owner_a = keyzapper_core::hermes::binding::ownership_after(&plan_a, None);
     let owner_b = keyzapper_core::hermes::binding::ownership_after(&plan_b, None);
 
@@ -904,13 +917,13 @@ fn plan_connect_rejects_a_model_that_does_not_match_the_explicit_tenant() {
     for model in ["other/sonnet", "sonnet", "team", "team/", "team-other/sonnet"] {
         let mut chosen = selection(ALPHA);
         chosen.model_id = model.into();
-        assert_eq!(plan_connect(&cli, chosen, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).err(),
+        assert_eq!(plan_connect(&cli, chosen, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).err(),
             Some(HermesError::PolicyDenied), "{model} must not pass the tenant guard");
     }
     assert!(cli.calls.borrow().is_empty(), "a rejected selection never even reads the config");
     let mut chosen = selection(ALPHA);
     chosen.model_id = "team/sonnet".into();
-    let plan = plan_connect(&cli, chosen, &profile(ALPHA), "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&cli, chosen, &profile(ALPHA), HELPER, None, &ManagedConfig::default()).unwrap();
     assert_eq!(plan.selection.model_id, "team/sonnet");
     assert!(plan.changes.iter().any(|change| change.key == "model.default"
         && matches!(&change.after, StoredValue::Present(value) if value == &json!("team/sonnet"))));

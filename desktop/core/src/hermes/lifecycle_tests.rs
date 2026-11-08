@@ -41,7 +41,7 @@ impl Fixture {
     fn connect(&self, model: &str) -> HermesResult<()> {
         let selection = HermesSelection { target: self.target.clone(), profile_id: PROFILE.into(), model_id: model.into(), tenant: None };
         let profile = Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), model.into());
-        connect(&self.cli, &self.store, selection, &profile, "/opt/keyzapper-helper", &ManagedConfig::default(), &self.cli.digest())
+        connect(&self.cli, &self.store, selection, &profile, self.root.join("keyzapper-helper").to_str().unwrap(), &ManagedConfig::default(), &self.cli.digest())
     }
     fn key(&self) -> String { store::HermesStore::target_key(&self.target).unwrap() }
     fn backup_exists(&self) -> bool { fs::read_dir(self.root.join("store/backups")).is_ok_and(|mut entries| entries.next().is_some()) }
@@ -54,7 +54,7 @@ fn lifecycle_connect_preview_plan_does_not_write_config_or_store() {
     let selection = HermesSelection { target: fx.target.clone(), profile_id: PROFILE.into(), model_id: "team/preview".into(), tenant: None };
     let profile = Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/preview".into());
     let before = fx.cli.fields.borrow().clone();
-    let plan = plan_connect(&fx.cli, selection, &profile, "/opt/keyzapper-helper", None, &ManagedConfig::default()).unwrap();
+    let plan = plan_connect(&fx.cli, selection, &profile, fx.root.join("keyzapper-helper").to_str().unwrap(), None, &ManagedConfig::default()).unwrap();
     assert!(!plan.changes.is_empty());
     assert_eq!(*fx.cli.writes.borrow(), 0);
     assert_eq!(*fx.cli.fields.borrow(), before);

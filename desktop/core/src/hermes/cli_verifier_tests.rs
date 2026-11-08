@@ -22,10 +22,13 @@ impl RecordedVerifier {
     }
 }
 impl Installation {
-    fn new() -> Self {
-        let scratch = ProbeHome::new().unwrap();
+    fn new() -> Self { Self::with_scratch(ProbeHome::new().unwrap()) }
+    fn with_scratch(scratch: ProbeHome) -> Self {
         let root = scratch.0.join("source");
         fs::create_dir(&root).unwrap();
+        // macOS temporary directories may be reached through /var -> /private/var.
+        // Recorded source identity must be canonical; production checks stay strict.
+        let root = fs::canonicalize(root).unwrap();
         fs::write(root.join("hermes_bootstrap.py"), "# public source fixture\n").unwrap();
         let target = HermesTarget { executable: scratch.0.join("hermes-cli"), home: scratch.0.join("hermes"), display_name: "fixture".into() };
         // Never executed: the private transport captures and validates every command.
@@ -63,6 +66,21 @@ impl Installation {
             _ => panic!("unexpected discovery command"),
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn recorded_verifier_fixture_supports_a_symlinked_temporary_parent() {
+    let parent = ProbeHome::new().unwrap();
+    let alias = parent.0.join("alias");
+    std::os::unix::fs::symlink(&parent.0, &alias).unwrap();
+    let scratch = alias.join("child");
+    fs::create_dir(&scratch).unwrap();
+    let install = Installation::with_scratch(ProbeHome(scratch));
+    assert_eq!(install.root, fs::canonicalize(&install.root).unwrap());
+    assert_eq!(verify_installation(&install.target, &install.fixture, |cmd| Ok(install.response(&cmd, &install.diagnostic))), Ok(()));
+    // Canonicalizing the fixture must not allow an aliased source root into the verifier.
+    assert!(public_source_fingerprint(&alias.join("child/source"), &install.fixture).is_err());
 }
 
 #[test]

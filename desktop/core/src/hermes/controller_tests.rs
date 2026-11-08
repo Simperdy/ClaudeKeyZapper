@@ -46,7 +46,7 @@ impl Fixture {
         fs::write(root.join("hermes"), b"synthetic").unwrap();
         let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "synthetic".into() };
         let selection = HermesSelection { target: target.clone(), profile_id: PROFILE.into(), model_id: "team/model".into(), tenant: None };
-        let inputs = Inputs { profiles: vec![Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/model".into())], policy: ManagedConfig::default(), disabled: false, helper: Some("/opt/keyzapper-helper".into()), targets: vec![target], diagnostics: vec![] };
+        let inputs = Inputs { profiles: vec![Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/model".into())], policy: ManagedConfig::default(), disabled: false, helper: Some(root.join("keyzapper-helper").to_str().unwrap().into()), targets: vec![target], diagnostics: vec![] };
         Self { controller: Controller::new(HermesStore::new(root.join("store"))), inputs, selection, root, cli: Fake { fields: RefCell::new(BTreeMap::from([("model.default".into(), json!("original"))])), writes: RefCell::new(Vec::new()), before_write: RefCell::new(None) } }
     }
 }
