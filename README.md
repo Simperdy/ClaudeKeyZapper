@@ -85,6 +85,8 @@ helper cache expires (default 5 min), after an HTTP 401, or after a restart.
 
 ## SSO profiles
 
+KeyZapper also has an **experimental, exact-build Hermes integration**; macOS/workplace acceptance is still pending. See the [Hermes setup, recovery and acceptance guide](docs/hermes-integration.md) before using it.
+
 Profiles can authenticate via a static LiteLLM key (Key type) or via OIDC login (SSO type). SSO requires
 an OIDC-verifying proxy in front of LiteLLM that validates the token (access token by default) and injects the virtual key into requests.
 

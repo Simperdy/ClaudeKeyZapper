@@ -18,6 +18,9 @@ use keyzapper_core::paths::{self, abbreviate_home, folder_name};
 use keyzapper_core::settings::{self, BindingHealth, BindingStatus, SettingsBinder};
 use keyzapper_core::update::ReleaseInfo;
 use keyzapper_core::tokens::TokenStore;
+use keyzapper_core::hermes::{controller::{Controller as HermesController, HermesView}, store::HermesStore};
+#[cfg(test)]
+use keyzapper_core::hermes::{HermesTarget, controller::{HermesTargetView, HermesTestStatus}};
 use keyzapper_core::mcp_catalog::{Catalog, FetchError};
 use keyzapper_core::tools::{Tool, ToolStatus};
 use keyzapper_core::{agents, claude_desktop, cli, helper, l, legacy_keychain, mcp, mcp_catalog, oidc, subscription, update, whats_new};
@@ -95,6 +98,7 @@ pub struct Model {
     pub installing_tool: Option<Tool>,
     /// KeyZapper's entry in Claude Desktop's configuration library.
     pub claude_desktop: claude_desktop::Status,
+    pub(crate) hermes_controller: HermesController,
     backup_dir: Option<PathBuf>,
     metadata: MetadataStore,
     /// Set when metadata could not be read (e.g. newer schema); saving is blocked to avoid data loss.
@@ -272,6 +276,7 @@ impl Model {
             tools: None,
             installing_tool: None,
             claude_desktop: claude_desktop::Status::default(),
+            hermes_controller: HermesController::new(HermesStore::new(data_dir.join("hermes"))),
             backup_dir,
             metadata,
             metadata_unreadable: false,
@@ -528,6 +533,18 @@ impl Model {
     }
 
     pub fn save_profile(&mut self, profile: Profile, new_key: Option<String>) -> bool {
+        let _permit = match self.hermes_controller.profile_change(Some(&profile.id), false) {
+            Ok(permit) => permit,
+            Err(problem) => { self.error = Some(problem); return false; }
+        };
+        // A bound profile may be renamed or have its key rotated, but its route/identity may
+        // only change after an explicit Hermes disconnect (or nothing at all here).
+        if let Some(old) = self.profile(&profile.id) {
+            if let Err(problem) = self.hermes_controller.expect_unbound_for_routing_change(&old, &profile) {
+                self.error = Some(problem);
+                return false;
+            }
+        }
         if !self.is_allowed(&profile) {
             self.error = Some(self.not_allowed_message(&profile.endpoint));
             return false;
@@ -591,6 +608,10 @@ impl Model {
 
     pub fn delete_profile(&mut self, id: &str) {
         let Some(profile) = self.profile(id) else { return };
+        let _permit = match self.hermes_controller.profile_change(Some(id), true) {
+            Ok(permit) => permit,
+            Err(problem) => { self.error = Some(problem); return; }
+        };
         for binding in self.state.bindings.clone().iter().filter(|b| b.profile_id == profile.id) {
             if !self.unbind(&binding.id) {
                 return;
@@ -1364,6 +1385,8 @@ impl Model {
         let Some(backup) = self.available_backup.take() else { return };
         for profile in &backup.profiles {
             if self.state.profile(&profile.id).is_none() {
+                // A pending journal can still own this ID's partially written route.
+                if self.hermes_controller.has_pending_operation_for_profile(&profile.id).unwrap_or(true) { continue; }
                 self.state.profiles.push(profile.clone());
             }
         }
@@ -1412,9 +1435,37 @@ impl Model {
 
     /// Restores profiles and keys from an encrypted backup and re-assigns projects whose folders exist here.
     pub fn import_payload(&mut self, payload: BackupPayload) -> bool {
+        let _permit = match self.hermes_controller.profile_change(None, false) {
+            Ok(permit) => permit,
+            Err(problem) => { self.error = Some(problem); return false; }
+        };
         if self.is_disabled() {
             self.error = Some(l!("KeyZapper ist deaktiviert. Bitte zuerst wieder aktivieren."));
             return false;
+        }
+        // A restored backup must not re-point an actively bound profile's route/identity
+        // while its Hermes provider still names the old gateway. Fail closed on an
+        // unreadable registry, then refuse both the profile change and its imported key.
+        // The per-profile decision goes through the same controller guard as save_profile
+        // and managed sync, so a pending journal without a committed owner also blocks it.
+        if self.hermes_controller.store().load().is_err() {
+            self.error = Some(l!("Die Hermes-Zuordnungsregistrierung ist nicht lesbar; der Backup-Import ist gesperrt."));
+            return false;
+        }
+        let mut routing_blocked = std::collections::BTreeSet::new();
+        for profile in &payload.state.profiles {
+            let Some(existing) = self.profile(&profile.id) else {
+                // The profile is absent locally, but a pending journal can still describe
+                // its partially written route; do not restore a fresh identity over it.
+                if self.hermes_controller.has_pending_operation_for_profile(&profile.id).unwrap_or(true) {
+                    routing_blocked.insert(profile.id.clone());
+                }
+                continue;
+            };
+            if self.config.is_managed(&profile.id) || existing == *profile { continue; }
+            if self.hermes_controller.expect_unbound_for_routing_change(&existing, profile).is_err() {
+                routing_blocked.insert(profile.id.clone());
+            }
         }
         let mut skipped = 0;
         let mut changed_profiles = Vec::new();
@@ -1426,12 +1477,19 @@ impl Model {
             let managed = self.config.is_managed(&profile.id);
             match self.state.profiles.iter_mut().find(|p| p.id == profile.id) {
                 Some(existing) => {
-                    if !managed && existing != profile {
+                    if !managed && existing != profile && !routing_blocked.contains(&profile.id) {
                         *existing = profile.clone();
                         // The cached model list belongs to the old gateway; the next refresh loads the new one.
                         self.gateway_models.remove(&profile.id);
                         changed_profiles.push(profile.id.clone());
+                    } else if routing_blocked.contains(&profile.id) {
+                        skipped += 1;
+                        continue;
                     }
+                }
+                None if routing_blocked.contains(&profile.id) => {
+                    skipped += 1;
+                    continue;
                 }
                 None => self.state.profiles.push(profile.clone()),
             }
@@ -1443,6 +1501,7 @@ impl Model {
         let mut key_count = 0;
         for (id, key) in &payload.keys {
             let Some(id) = parse_id(id) else { continue };
+            if routing_blocked.contains(&id) { skipped += 1; continue; }
             if self.state.profile(&id).is_some() && self.keys.write(&id, key).is_ok() {
                 key_count += 1;
                 self.keychain_profiles.retain(|p| *p != id);
@@ -1562,6 +1621,10 @@ impl Model {
     /// Deactivation removes KeyZapper's values from all projects and the user settings but keeps the assignments,
     /// so activating writes them again. Claude Code meanwhile uses its normal login everywhere.
     pub fn set_disabled(&mut self, disable: bool) {
+        let _permit = match self.hermes_controller.profile_change(None, disable && !self.is_disabled()) {
+            Ok(permit) => permit,
+            Err(problem) => { self.error = Some(problem); return; }
+        };
         let Some(binder) = self.binder.clone() else { return };
         if disable == self.is_disabled() {
             return;
@@ -1901,6 +1964,7 @@ impl Model {
             project_url: format!("https://github.com/{}", keyzapper_core::update::REPOSITORY),
             minimum_password_length: keyzapper_core::backup::MINIMUM_PASSWORD_LENGTH,
             vibrancy: self.vibrancy,
+            hermes: self.hermes_controller.view(),
         }
     }
 }
@@ -1987,7 +2051,9 @@ pub struct View {
     project_url: String,
     minimum_password_length: usize,
     vibrancy: bool,
+    hermes: HermesView,
 }
+
 
 #[derive(Debug, PartialEq)]
 pub struct TrayInfo {
@@ -2199,6 +2265,28 @@ mod tests {
     const TEMPLATE: &str = include_str!("../../core/tests/fixtures/office-manifest.xml");
     const ID: &str = "5c1d7e2a-8b3f-4e6d-9a0c-2f4b6d8e1a3c";
 
+    #[test]
+    fn hermes_view_serializes_only_nonsecret_target_status() {
+        let target = HermesTarget { executable: "/opt/hermes".into(), home: "/tmp/hermes-profile".into(), display_name: "profile".into() };
+        let view = HermesView {
+            targets: vec![HermesTargetView { target: target.clone(), supported: false }],
+            diagnostics: vec![],
+            selected: None,
+            recovery_target: Some(target.clone()),
+            health: "recoveryRequired".into(),
+            problem: None,
+            busy: false,
+            test_status: HermesTestStatus::NotTested,
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("recoveryRequired"));
+        assert!(json.contains("recoveryTarget"));
+        assert!(json.contains("/tmp/hermes-profile"));
+        for forbidden in ["credential", "token", "history", "backup", "confirmationId", "configDigest"] {
+            assert!(!json.to_ascii_lowercase().contains(&forbidden.to_ascii_lowercase()), "leaked {forbidden}");
+        }
+    }
+
     fn office() -> OfficeClient {
         OfficeClient {
             enabled: true,
@@ -2264,6 +2352,304 @@ mod tests {
             user_settings_path: root.join("user-settings.json").to_string_lossy().into_owned(),
         });
         model
+    }
+
+    /// A faithful persisted journal for an interrupted first connect: no owner, the
+    /// original route fields absent, and all four managed fields in flight.
+    fn pending_hermes_journal(target: &HermesTarget, profile_id: &str, endpoint: &str) -> keyzapper_core::hermes::store::Journal {
+        use keyzapper_core::hermes::{
+            binding::{BindingPlan, FieldChange},
+            store::{Journal, Operation, Phase},
+            ConfigSnapshot, HermesSelection, StoredValue,
+        };
+        let fields = BTreeMap::from(["model.base_url", "model.default", "model.provider", "providers.keyzapper"]
+            .map(|key| (key.to_string(), StoredValue::Absent)));
+        let changes = [
+            ("model.base_url", endpoint),
+            ("model.default", "team/model"),
+            ("model.provider", "keyzapper"),
+            ("providers.keyzapper", endpoint),
+        ].map(|(key, value)| FieldChange {
+            key: key.into(),
+            before: StoredValue::Absent,
+            after: StoredValue::Present(serde_json::json!(value)),
+        }).to_vec();
+        Journal {
+            plan: BindingPlan {
+                selection: HermesSelection { target: target.clone(), profile_id: profile_id.into(), model_id: "team/model".into(), tenant: None },
+                snapshot: ConfigSnapshot { config_path: target.home.join("config.yaml"), config_digest: "0".repeat(64), fields },
+                changes,
+            },
+            completed: vec![],
+            phase: Phase::RecoveryRequired,
+            operation: Operation::Connect,
+        }
+    }
+
+    #[test]
+    fn hermes_inflight_controller_blocks_model_delete_deactivate_and_profile_save() {
+        let root = std::env::temp_dir().join(format!("kz-hermes-model-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let profile = Profile::new(new_id(), "synthetic".into(), "https://gateway.test".into(), String::new());
+        assert!(model.save_profile(profile.clone(), None));
+        let controller_snapshot = model.hermes_controller.clone();
+        let permit = controller_snapshot.begin().unwrap();
+        let before = serde_json::to_vec(&model.state).unwrap();
+        model.delete_profile(&profile.id);
+        assert!(model.error.take().is_some());
+        model.set_disabled(true);
+        assert!(model.error.take().is_some());
+        let mut edited = profile.clone();
+        edited.endpoint = "https://other.test".into();
+        assert!(!model.save_profile(edited, None));
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), before);
+        assert!(!root.join("user-settings.json").exists());
+        drop(permit);
+        model.delete_profile(&profile.id);
+        assert!(model.state.profile(&profile.id).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bound_profile_routing_change_needs_explicit_disconnect_and_is_never_rekeyed() {
+        use keyzapper_core::hermes::{binding::Ownership, store::HermesStore as CoreStore, HermesSelection, HermesTarget};
+        let root = std::env::temp_dir().join(format!("kz-hermes-routing-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let profile = Profile::new(new_id(), "synthetic".into(), "https://gateway-a.test".into(), String::new());
+        assert!(model.save_profile(profile.clone(), Some("sk-a".into())));
+        let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "synthetic".into() };
+        std::fs::create_dir_all(&target.home).unwrap();
+        std::fs::write(&target.executable, b"synthetic").unwrap();
+        let selection = HermesSelection { target: target.clone(), profile_id: profile.id.clone(), model_id: "team/model".into(), tenant: None };
+        let controller = model.hermes_controller.clone();
+        let key = CoreStore::target_key(&target).unwrap();
+        controller.store().commit(&key, Some(Ownership { selection, original: Default::default(), last_written: Default::default() })).unwrap();
+        let registry = std::fs::read(root.join("data/hermes/registry.json")).unwrap();
+        let state = serde_json::to_vec(&model.state).unwrap();
+
+        let mut moved = profile.clone();
+        moved.endpoint = "https://gateway-b.test".into();
+        assert!(!model.save_profile(moved.clone(), Some("sk-b".into())));
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), state, "refused edit must not be persisted");
+        assert_eq!(std::fs::read(root.join("data/hermes/registry.json")).unwrap(), registry);
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-a", "no new key may be paired with the old route");
+        let mut resigned = profile.clone();
+        resigned.oidc_scope = Some("openid".into());
+        assert!(!model.save_profile(resigned, None));
+        assert!(model.error.take().is_some());
+
+        // A rename and a key rotation at the unchanged endpoint stay allowed.
+        let mut renamed = profile.clone();
+        renamed.name = "renamed".into();
+        assert!(model.save_profile(renamed, Some("sk-rotated".into())));
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+        assert_eq!(std::fs::read(root.join("data/hermes/registry.json")).unwrap(), registry);
+
+        // A backup import may not re-point the bound profile or replace its key either.
+        let mut backup_state = model.state.clone();
+        let mut imported = profile.clone();
+        imported.endpoint = "https://gateway-b.test".into();
+        imported.name = "imported".into();
+        backup_state.profiles = vec![imported];
+        let payload = BackupPayload {
+            created_at: String::new(), app_version: None, state: backup_state,
+            keys: BTreeMap::from([(profile.id.clone(), "sk-imported".into())]),
+        };
+        assert!(model.import_payload(payload));
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-a.test");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+        assert_eq!(std::fs::read(root.join("data/hermes/registry.json")).unwrap(), registry);
+
+        // A managed profile is only ever updated through the same guarded save.
+        model.config.profiles.push(keyzapper_core::managed::ManagedProfile {
+            id: profile.id.clone(), name: "managed".into(), endpoint: "https://gateway-b.test".into(),
+            model_alias: String::new(), opus_model: None, sonnet_model: None, haiku_model: None, environment: None,
+            auth_type: AuthType::ApiKey, oidc_issuer: None, oidc_client_id: None, oidc_scope: None,
+            oidc_token_type: keyzapper_core::models::OidcTokenType::Access, office: None, claude_desktop: None,
+        });
+        model.sync_managed_profiles();
+        assert!(model.error.take().is_some());
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-a.test");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+
+        // Only an explicit disconnect releases the route for a new endpoint.
+        controller.store().commit(&key, None).unwrap();
+        assert!(model.save_profile(moved, Some("sk-b".into())));
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-b.test");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-b");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hermes_pending_recovery_without_owner_blocks_profile_routing_import_and_managed_sync() {
+        use keyzapper_core::hermes::store::HermesStore as CoreStore;
+        let root = std::env::temp_dir().join(format!("kz-hermes-pending-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let profile = Profile::new(new_id(), "synthetic".into(), "https://gateway-a.test".into(), String::new());
+        assert!(model.save_profile(profile.clone(), Some("sk-a".into())));
+        let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "synthetic".into() };
+        std::fs::create_dir_all(&target.home).unwrap();
+        std::fs::write(&target.executable, b"synthetic").unwrap();
+        let config_path = target.home.join("config.yaml");
+        let partial_config = b"model:\n  base_url: https://gateway-a.test\nproviders:\n  keyzapper:\n    base_url: https://gateway-a.test\n";
+        std::fs::write(&config_path, partial_config).unwrap();
+        let journal = pending_hermes_journal(&target, &profile.id, "https://gateway-a.test");
+        let key = CoreStore::target_key(&target).unwrap();
+        model.hermes_controller.store().save_journal(&key, &journal).unwrap();
+        assert!(model.hermes_controller.store().load().unwrap().is_empty(), "partial first connect has no committed owner");
+        let registry_path = root.join("data/hermes/registry.json");
+        let registry = std::fs::read(&registry_path).unwrap();
+
+        let state = serde_json::to_vec(&model.state).unwrap();
+        let mut moved = profile.clone();
+        moved.endpoint = "https://gateway-b.test".into();
+        assert!(!model.save_profile(moved.clone(), Some("sk-b".into())));
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), state, "refused edit must not be persisted");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-a");
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry);
+        assert_eq!(std::fs::read(&config_path).unwrap(), partial_config);
+
+        // A rename and a key rotation at the unchanged route stay possible while recovery is pending.
+        let mut renamed = profile.clone();
+        renamed.name = "renamed".into();
+        assert!(model.save_profile(renamed.clone(), Some("sk-rotated".into())));
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry);
+        assert_eq!(std::fs::read(&config_path).unwrap(), partial_config);
+
+        let mut backup_state = model.state.clone();
+        let mut imported = renamed.clone();
+        imported.endpoint = "https://gateway-b.test".into();
+        imported.name = "imported".into();
+        backup_state.profiles = vec![imported];
+        let payload = BackupPayload {
+            created_at: String::new(), app_version: None, state: backup_state,
+            keys: BTreeMap::from([(profile.id.clone(), "sk-imported".into())]),
+        };
+        let state = serde_json::to_vec(&model.state).unwrap();
+        assert!(model.import_payload(payload));
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-a.test");
+        assert_eq!(model.profile(&profile.id).unwrap().name, "renamed");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), state);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry);
+        assert_eq!(std::fs::read(&config_path).unwrap(), partial_config);
+
+        model.config.profiles.push(keyzapper_core::managed::ManagedProfile {
+            id: profile.id.clone(), name: "managed".into(), endpoint: "https://gateway-b.test".into(),
+            model_alias: String::new(), opus_model: None, sonnet_model: None, haiku_model: None, environment: None,
+            auth_type: AuthType::ApiKey, oidc_issuer: None, oidc_client_id: None, oidc_scope: None,
+            oidc_token_type: keyzapper_core::models::OidcTokenType::Access, office: None, claude_desktop: None,
+        });
+        model.sync_managed_profiles();
+        assert!(model.error.take().is_some());
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-a.test");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-rotated");
+
+        // A same-ID profile that is absent locally is not restored over its pending route.
+        let absent = Profile::new(new_id(), "absent".into(), "https://gateway-b.test".into(), String::new());
+        let mut journal = model.hermes_controller.store().journal(&key).unwrap().unwrap();
+        journal.plan.selection.profile_id = absent.id.clone();
+        model.hermes_controller.store().save_journal(&key, &journal).unwrap();
+        let mut backup_state = model.state.clone();
+        backup_state.profiles = vec![absent.clone()];
+        let payload = BackupPayload {
+            created_at: String::new(), app_version: None, state: backup_state,
+            keys: BTreeMap::from([(absent.id.clone(), "sk-absent".into())]),
+        };
+        assert!(model.import_payload(payload));
+        assert!(model.profile(&absent.id).is_none());
+        assert!(model.keys.read(&absent.id).is_err());
+
+        // Once recovery is gone, the route may change.
+        std::fs::write(&registry_path, br#"{"ownership":{},"journals":{}}"#).unwrap();
+        let mut routed = model.profile(&profile.id).unwrap();
+        routed.endpoint = "https://gateway-b.test".into();
+        assert!(model.save_profile(routed.clone(), Some("sk-b".into())));
+        assert_eq!(model.profile(&profile.id).unwrap().endpoint, "https://gateway-b.test");
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-b");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hermes_absent_pending_profile_is_not_restored_from_onedrive_backup() {
+        use keyzapper_core::hermes::store::HermesStore as CoreStore;
+        let root = std::env::temp_dir().join(format!("kz-hermes-restore-pending-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let absent = Profile::new(new_id(), "absent".into(), "https://gateway-b.test".into(), String::new());
+        let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "synthetic".into() };
+        std::fs::create_dir_all(&target.home).unwrap();
+        std::fs::write(&target.executable, b"synthetic").unwrap();
+        let journal = pending_hermes_journal(&target, &absent.id, "https://gateway-b.test");
+        model.hermes_controller.store().save_journal(&CoreStore::target_key(&target).unwrap(), &journal).unwrap();
+        let mut backup = model.state.clone();
+        backup.profiles = vec![absent.clone()];
+        model.available_backup = Some(backup.clone());
+        model.restore_from_backup();
+        assert!(model.profile(&absent.id).is_none(), "a pending route must not be overwritten by a restored identity");
+
+        // Once recovery is gone, the same OneDrive restore adds the profile.
+        std::fs::write(root.join("data/hermes/registry.json"), br#"{"ownership":{},"journals":{}}"#).unwrap();
+        model.available_backup = Some(backup);
+        model.restore_from_backup();
+        assert_eq!(model.profile(&absent.id).unwrap().endpoint, "https://gateway-b.test");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hermes_unreadable_registry_fails_closed_for_profile_routing_and_import() {
+        let root = std::env::temp_dir().join(format!("kz-hermes-unreadable-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let profile = Profile::new(new_id(), "synthetic".into(), "https://gateway-a.test".into(), String::new());
+        assert!(model.save_profile(profile.clone(), Some("sk-a".into())));
+        let registry_path = root.join("data/hermes/registry.json");
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        std::fs::write(&registry_path, b"synthetic-invalid-registry").unwrap();
+        let registry = std::fs::read(&registry_path).unwrap();
+        let state = serde_json::to_vec(&model.state).unwrap();
+
+        let mut moved = profile.clone();
+        moved.endpoint = "https://gateway-b.test".into();
+        assert!(!model.save_profile(moved.clone(), Some("sk-b".into())));
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), state);
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-a");
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry);
+
+        let mut backup_state = model.state.clone();
+        backup_state.profiles = vec![moved];
+        let payload = BackupPayload {
+            created_at: String::new(), app_version: None, state: backup_state,
+            keys: BTreeMap::from([(profile.id.clone(), "sk-imported".into())]),
+        };
+        assert!(!model.import_payload(payload));
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), state);
+        assert_eq!(model.keys.read(&profile.id).unwrap(), "sk-a");
+        assert_eq!(std::fs::read(&registry_path).unwrap(), registry);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hermes_corrupt_registry_refuses_model_deletion_and_deactivation() {
+        let root = std::env::temp_dir().join(format!("kz-hermes-corrupt-{}", new_id()));
+        let mut model = model_with_binder(&root);
+        let profile = Profile::new(new_id(), "synthetic".into(), "https://gateway.test".into(), String::new());
+        assert!(model.save_profile(profile.clone(), None));
+        let dir = root.join("data/hermes");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("registry.json"), b"synthetic-invalid").unwrap();
+        let before = serde_json::to_vec(&model.state).unwrap();
+        model.delete_profile(&profile.id);
+        assert!(model.error.take().is_some());
+        model.set_disabled(true);
+        assert!(model.error.take().is_some());
+        assert_eq!(serde_json::to_vec(&model.state).unwrap(), before);
+        assert!(!root.join("user-settings.json").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -479,6 +479,100 @@ fn helper_returns_only_requested_key_and_never_falls_back() {
 }
 
 #[test]
+fn hermes_json_static_key_has_no_invented_expiry() {
+    let dir = temp_dir("hermes-json-key");
+    let h = helper(&dir, BTreeMap::new());
+    h.metadata.save(&AppState { profiles: vec![sample()], ..AppState::default() }).unwrap();
+    h.store.write(ALPHA, "synthetic-key").unwrap();
+    let mut a = args("credential", ALPHA); a.push("--json".into());
+    let out = h.run(&a, String::new);
+    assert_eq!(out.exit_code, ExitCode::Ok);
+    assert_eq!(serde_json::from_str::<Value>(&out.stdout).unwrap(), json!({"access_token":"synthetic-key"}));
+    assert!(out.stderr.is_empty());
+    assert_eq!(h.run(&args("credential", ALPHA), String::new).stdout, "synthetic-key");
+}
+
+#[test]
+fn hermes_json_sso_contains_only_matching_credential_and_expiry() {
+    let dir = temp_dir("hermes-json-sso");
+    let h = helper(&dir, BTreeMap::new());
+    h.metadata.save(&AppState { profiles: vec![sso()], ..AppState::default() }).unwrap();
+    let expiry = far_future();
+    h.tokens.write(BETA, &TokenSet { refresh_token: "NEVER-OUTPUT".into(), access_token: Some("synthetic-access".into()), expires_at: Some(expiry), token_type: Default::default(), expiry_verified: Some(true) }).unwrap();
+    let mut a = args("credential", BETA); a.push("--json".into());
+    let out = h.run(&a, String::new);
+    assert_eq!(out.exit_code, ExitCode::Ok);
+    assert_eq!(serde_json::from_str::<Value>(&out.stdout).unwrap(), json!({"access_token":"synthetic-access", "expiry":keyzapper_core::time::iso8601_utc_at(expiry)}));
+    assert!(!out.stdout.contains("NEVER-OUTPUT"));
+}
+
+#[test]
+fn hermes_json_sso_returns_configured_id_token() {
+    let dir = temp_dir("hermes-json-id-token");
+    let h = helper(&dir, BTreeMap::new());
+    let mut profile = sso();
+    profile.oidc_token_type = keyzapper_core::models::OidcTokenType::Id;
+    h.metadata.save(&AppState { profiles: vec![profile], ..AppState::default() }).unwrap();
+    let expiry = far_future();
+    h.tokens.write(BETA, &TokenSet { refresh_token: "DO-NOT-OUTPUT".into(), access_token: Some("configured-id-token".into()), expires_at: Some(expiry), token_type: keyzapper_core::models::OidcTokenType::Id, expiry_verified: Some(true) }).unwrap();
+    let mut a = args("credential", BETA); a.push("--json".into());
+    let out = h.run(&a, String::new);
+    assert_eq!(out.exit_code, ExitCode::Ok);
+    assert_eq!(serde_json::from_str::<Value>(&out.stdout).unwrap(), json!({"access_token":"configured-id-token", "expiry":keyzapper_core::time::iso8601_utc_at(expiry)}));
+    assert!(!out.stdout.contains("DO-NOT-OUTPUT"));
+}
+
+#[test]
+fn hermes_json_omits_unverified_sso_expiry_and_rejects_bad_invocations() {
+    let dir = temp_dir("hermes-json-unverified");
+    let h = helper(&dir, BTreeMap::new());
+    h.metadata.save(&AppState { profiles: vec![sample(), sso()], ..AppState::default() }).unwrap();
+    h.tokens.write(BETA, &TokenSet { refresh_token: String::new(), access_token: Some("secret-access".into()), expires_at: Some(far_future()), token_type: Default::default(), expiry_verified: None }).unwrap();
+    let mut json_args = args("credential", BETA); json_args.push("--json".into());
+    let out = h.run(&json_args, String::new);
+    assert_eq!(out.exit_code, ExitCode::SessionExpired);
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.contains("secret-access"));
+    for bad in [vec!["pool".into(), "--profile".into(), ALPHA.into(), "--json".into()], vec!["credential".into(), "--profile".into(), ALPHA.into(), "--json".into(), "--json".into()], vec!["credential".into(), "--profile".into(), ALPHA.into(), "extra".into()]] {
+        let out = h.run(&bad, String::new);
+        assert_eq!(out.exit_code, ExitCode::Usage);
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn hermes_json_failures_never_release_a_credential() {
+    let dir = temp_dir("hermes-json-failures");
+    let h = helper(&dir, BTreeMap::new());
+    let mut subscription = sample();
+    subscription.id = BETA.into();
+    subscription.auth_type = AuthType::Subscription;
+    h.metadata.save(&AppState { profiles: vec![sample(), subscription], ..AppState::default() }).unwrap();
+    let request = |id: &str| { let mut a = args("credential", id); a.push("--json".into()); a };
+    for (id, expected) in [(ALPHA, ExitCode::MissingCredential), ("6F1E2D3C-0000-4978-8695-A4B3C2D1E0F9", ExitCode::UnknownProfile), (BETA, ExitCode::Usage)] {
+        let out = h.run(&request(id), String::new);
+        assert_eq!(out.exit_code, expected);
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.contains("synthetic"));
+    }
+    let mut denied = helper(&dir, BTreeMap::new());
+    denied.metadata.save(&AppState { profiles: vec![sample()], ..AppState::default() }).unwrap();
+    denied.store.write(ALPHA, "synthetic-secret").unwrap();
+    denied.config.allowed_gateway_hosts = vec!["other.example".into()];
+    let out = denied.run(&request(ALPHA), String::new);
+    assert_eq!(out.exit_code, ExitCode::ConfigError);
+    assert!(out.stdout.is_empty() && !out.stderr.contains("synthetic-secret"));
+    let insecure = helper(&dir, BTreeMap::new());
+    let mut http_profile = sample();
+    http_profile.endpoint = "http://gateway.example.test".into();
+    insecure.metadata.save(&AppState { profiles: vec![http_profile], ..AppState::default() }).unwrap();
+    insecure.store.write(ALPHA, "synthetic-secret").unwrap();
+    let out = insecure.run(&request(ALPHA), String::new);
+    assert_eq!(out.exit_code, ExitCode::ConfigError);
+    assert!(out.stdout.is_empty() && !out.stderr.contains("synthetic-secret"));
+}
+
+#[test]
 fn helper_respects_gateway_allowlist() {
     let dir = temp_dir("helper");
     let mut h = helper(&dir, BTreeMap::new());
@@ -573,7 +667,7 @@ fn token_store_round_trips_and_stays_out_of_keys_file() {
     let dir = temp_dir("tokens");
     let tokens = TokenStore { file: Path::new(&dir).join("sso-tokens.json") };
     assert!(!tokens.exists(BETA).unwrap());
-    tokens.write(BETA, &TokenSet { refresh_token: "R".into(), access_token: Some("A".into()), expires_at: Some(5), token_type: Default::default() }).unwrap();
+    tokens.write(BETA, &TokenSet { refresh_token: "R".into(), access_token: Some("A".into()), expires_at: Some(5), token_type: Default::default(), expiry_verified: None }).unwrap();
     assert!(tokens.exists(BETA).unwrap());
     assert_eq!(tokens.read(BETA).unwrap().unwrap().access_token.as_deref(), Some("A"));
     assert!(!Path::new(&dir).join("keys.json").exists());
@@ -593,7 +687,7 @@ fn sso_helper_exit_codes() {
     assert_eq!(h.run(&args("credential", BETA), String::new).exit_code, ExitCode::SessionExpired);
     assert_eq!(ExitCode::SessionExpired as i32, 67);
     // Cached, still valid access token.
-    h.tokens.write(BETA, &TokenSet { refresh_token: "R".into(), access_token: Some("jwt-1".into()), expires_at: Some(far_future()), token_type: Default::default() }).unwrap();
+    h.tokens.write(BETA, &TokenSet { refresh_token: "R".into(), access_token: Some("jwt-1".into()), expires_at: Some(far_future()), token_type: Default::default(), expiry_verified: None }).unwrap();
     let out = h.run(&args("credential", BETA), String::new);
     assert_eq!((out.exit_code, out.stdout.as_str()), (ExitCode::Ok, "jwt-1"));
     assert_eq!(h.run(&args("status", BETA), String::new).exit_code, ExitCode::Ok);
@@ -638,7 +732,7 @@ fn sso_profiles_are_never_bound_with_pool() {
 fn backup_keeps_sso_metadata_but_never_tokens() {
     let dir = temp_dir("sso-backup");
     let tokens = TokenStore { file: Path::new(&dir).join("sso-tokens.json") };
-    tokens.write(BETA, &TokenSet { refresh_token: "refresh-secret".into(), access_token: Some("access-secret".into()), expires_at: Some(1), token_type: Default::default() }).unwrap();
+    tokens.write(BETA, &TokenSet { refresh_token: "refresh-secret".into(), access_token: Some("access-secret".into()), expires_at: Some(1), token_type: Default::default(), expiry_verified: None }).unwrap();
     let mut payload = payload();
     payload.state.profiles.push(sso());
     let plain = serde_json::to_string(&payload).unwrap();

@@ -1,4 +1,5 @@
 // KeyZapper UI: renders the view the Rust side sends and calls its commands. No framework, no build step.
+import { createHermesController, hermesPage } from './hermes.js';
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
@@ -88,7 +89,7 @@ function button(label, onClick, { iconName, cls, disabled, title, iconOnly } = {
   }, iconName && icon(iconName), !iconOnly && label);
 }
 
-async function call(command, args) {
+async function call(command, args, { quiet = false } = {}) {
   try {
     const result = await invoke(command, args);
     if (result?.profiles) setView(result);
@@ -96,10 +97,37 @@ async function call(command, args) {
     else setView(await invoke('get_view'));
     return result;
   } catch (error) {
-    showAlert(String(error));
+    if (!quiet) showAlert(String(error));
     return null;
   }
 }
+
+const hermesController = createHermesController({
+  call: (command, args) => call(command, args, { quiet: true }),
+  readView: () => invoke('get_view'),
+  changed: () => { if (page === 'hermes') renderMain(); },
+  confirm: async ({ action, target, selection, preview }) => {
+    const profile = selection && view.profiles.find((item) => item.id === selection.profileId);
+    const label = action === 'connect' ? t('Hermes verbinden') : action === 'disconnect' ? t('Hermes-Verbindung entfernen') : t('Hermes-Vorgang reparieren');
+    const recoverySummary = preview?.summary?.startsWith('Clean up artifacts')
+      ? t('Hermes räumt vorbereitete Artefakte des unterbrochenen Vorgangs am Ziel %@ auf.', target.displayName)
+      : preview?.summary?.startsWith('Roll back')
+        ? t('Hermes setzt die unvollständigen Änderungen des unterbrochenen Vorgangs am Ziel %@ zurück.', target.displayName)
+        : t('Hermes wählt anhand der gespeicherten Vorgangsphase zwischen dem Aufräumen vorbereiteter Artefakte und dem Zurücksetzen unvollständiger Änderungen am Ziel %@.', target.displayName);
+    const details = h('div', null,
+      h('p', null, t('Installation: %@', target.displayName)),
+      h('p', { class: 'mono selectable' }, t('Hermes-Home: %@', target.home)),
+      h('p', { class: 'mono selectable' }, t('Programm: %@', target.executable)),
+      profile && h('p', null, t('KeyZapper-Profil: %@', profile.name)),
+      selection && h('p', null, t('Mandant: %@', selection.tenant || t('Kein Tenant'))),
+      selection && h('p', null, t('Modell: %@', selection.modelId)),
+      action === 'connect' && h('p', null, t('Die Aktivierung des Hermes-Standardmodells wird auf das ausgewählte Modell geändert.')),
+      action === 'recover' && h('p', null, recoverySummary),
+      h('p', null, t('Öffne eine neue oder neu gestartete Hermes-Sitzung, damit diese Verbindung verwendet wird. Bestehende Sitzungen behalten möglicherweise den zwischengespeicherten statischen Key.')));
+    return confirmDialog(t('Hermes-Änderung bestätigen'), details, label);
+  },
+});
+let hermesRefreshed = false;
 
 const isMac = () => view?.platform !== 'windows';
 const revealLabel = () => (isMac() ? t('Im Finder zeigen') : t('Im Explorer zeigen'));
@@ -122,6 +150,9 @@ const locale = () => (navigator.language?.toLowerCase().startsWith(view.language
 
 function setView(next) {
   view = next;
+  // Same non-secret backend state path as the controller's own reads: keep the Hermes page
+  // snapshot in step with every published view instead of leaving it stale.
+  if (view.hermes) hermesController.sync(view.hermes);
   const root = document.documentElement;
   root.lang = view.language;
   // The popover gets the system material only on macOS (vibrancy); on Windows it paints its own background.
@@ -136,6 +167,7 @@ function setView(next) {
   for (const render of liveDialogs) render();
   if (view.error && !alertOpen) showAlert(view.error, () => call('dismiss_error'));
   if (view.whatsNew.length && !whatsNewShown) whatsNewDialog();
+  if (!hermesRefreshed) { hermesRefreshed = true; hermesController.refresh(); }
 }
 
 // MARK: Navigation
@@ -144,6 +176,7 @@ const PAGES = () => [
   ['profiles', t('Profile'), 'key'],
   ['projects', t('Projekte'), 'folder'],
   ['mcp', t('MCP-Server'), 'plug'],
+  ['hermes', t('Hermes'), 'plug'],
   view.claudeToolsEnabled && ['tools', t('Claude-Tools'), 'download'],
   ['settings', t('Claude-Einstellungen'), 'shield'],
   ['backup', t('Backup'), 'archive'],
@@ -155,6 +188,7 @@ try { page = localStorage.getItem('page') ?? page; } catch { /* storage unavaila
 function navigate(next) {
   page = next;
   try { localStorage.setItem('page', next); } catch { /* storage unavailable */ }
+  if (next === 'hermes') hermesController.refresh();
   if (next === 'settings') {
     settingsSelection = null;
     call('refresh_all');
@@ -189,6 +223,8 @@ function renderSidebar() {
     onchange: async (event) => {
       if (event.target.checked) return call('set_disabled', { disabled: false });
       event.target.checked = true;
+      const blocked = hermesMutationBlock(null, true);
+      if (blocked) { await confirmDialog(t('Hermes zuerst trennen'), blocked, t('Verstanden')); return; }
       if (await confirmDialog(t('KeyZapper deaktivieren?'),
         t('KeyZapper entfernt seine Einträge aus allen Projekten und aus ~/.claude/settings.json. Die Zuordnungen bleiben gespeichert und werden beim Aktivieren wieder geschrieben.'),
         t('Deaktivieren'))) call('set_disabled', { disabled: true });
@@ -363,7 +399,7 @@ const contextMenu = (items) => (event) => {
 function renderMain() {
   const main = document.getElementById('main');
   const scroll = main.scrollTop;
-  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, tools: view.claudeToolsEnabled ? toolsPage : null, settings: settingsPage, backup: backupPage };
+  const pages = { profiles: profilesPage, projects: projectsPage, mcp: mcpPage, hermes: () => hermesPage({ view, t, h, field, pageHeader, controller: hermesController }), tools: view.claudeToolsEnabled ? toolsPage : null, settings: settingsPage, backup: backupPage };
   main.replaceChildren(...[(pages[page] ?? profilesPage)()].flat(Infinity).filter(Boolean));
   main.scrollTop = scroll;
 }
@@ -762,7 +798,26 @@ function projectRow(binding, profile) {
       icon(c.blocking ? 'error' : 'warning'), h('span', { class: 'selectable' }, c.message))));
 }
 
+function hermesMutationBlock(profileId, deactivating = false) {
+  const state = hermesController.state;
+  if (state.busy) return t('Warte, bis der Hermes-Vorgang abgeschlossen ist, bevor du Profile änderst.');
+  if (!state.loaded || state.problem) return t('Hermes-Besitzregister nicht verfügbar. Aktualisiere Hermes, bevor du Profile änderst.');
+  const selection = state.selection;
+  if (!selection) return null;
+  const profile = view.profiles.find((item) => item.id === selection.profileId);
+  if (profileId && selection.profileId !== profileId && profile) return null;
+  const name = profile?.name ?? selection.profileId;
+  return deactivating
+    ? t('Hermes-Verbindung vor der Deaktivierung von KeyZapper trennen. Betroffenes Ziel: %@', selection.target.home)
+    : t('Hermes-Verbindung vor dem Löschen von %@ trennen. Betroffenes Ziel: %@', name, selection.target.home);
+}
+
 async function deleteProfile(profile, bindings) {
+  const hermesBlock = hermesMutationBlock(profile.id);
+  if (hermesBlock) {
+    await confirmDialog(t('Hermes zuerst trennen'), hermesBlock, t('Verstanden'));
+    return;
+  }
   const message = profile.subscription
     ? (bindings.length ? t('%@ Projektzuordnung(en) werden zurückgenommen. Die Claude-Anmeldung in Claude Code bleibt bestehen.', bindings.length)
       : t('Die Claude-Anmeldung in Claude Code bleibt bestehen.'))
@@ -876,7 +931,7 @@ function confirmDialog(title, message, confirmLabel) {
   return new Promise((resolve) => {
     let confirmed = false;
     const { dialog } = openDialog(title, (close) => ({
-      body: [h('h2', null, title), h('p', { class: 'muted', style: 'margin:0' }, message)],
+      body: [h('h2', null, title), message instanceof Node ? message : h('p', { class: 'muted', style: 'margin:0' }, message)],
       actions: [button(t('Abbrechen'), close), button(confirmLabel, () => { confirmed = true; close(); }, { cls: 'primary danger' })],
     }));
     dialog.addEventListener('close', () => resolve(confirmed));

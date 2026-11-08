@@ -10,6 +10,7 @@ use keyzapper_core::models::budget_targets;
 use keyzapper_core::tools::{self, Tool};
 use keyzapper_core::{agents, backup, claude_desktop, claude_office, clipboard, gateway, l, legacy_keychain, mcp_catalog, oidc, subscription, update};
 use model::{McpServerInput, Model, ProfileInput, TenantBudget, View};
+use keyzapper_core::hermes::controller::{Action as HermesAction, Inputs as HermesInputs, Operation as HermesOperation, Preview as HermesPreview};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -319,6 +320,75 @@ fn start_background(app: &AppHandle) {
 }
 
 // MARK: Commands
+
+// Acquire the shared permit BEFORE cloning model inputs, under the very same UI
+// lock as delete/deactivate/save/import. All Hermes I/O runs after releasing it.
+fn hermes_inputs(app: &AppHandle) -> Result<(HermesOperation, HermesInputs), String> {
+    let (operation, mut inputs) = with_model(app, |m| {
+        let operation = m.hermes_controller.begin()?;
+        let inputs = HermesInputs {
+            profiles: m.state.profiles.clone(), policy: m.config.clone(), disabled: m.is_disabled(), helper: None,
+            targets: m.hermes_controller.view().targets.into_iter().map(|entry| entry.target).collect(),
+            diagnostics: m.hermes_controller.view().diagnostics,
+        };
+        Ok::<_, String>((operation, inputs))
+    })?;
+    inputs.helper = model::helper_path().map(|p| p.to_string_lossy().into_owned());
+    Ok((operation, inputs))
+}
+
+#[tauri::command]
+async fn hermes_refresh(app: AppHandle) -> View {
+    blocking(move || {
+        let Ok((operation, mut inputs)) = hermes_inputs(&app) else { return view(&app) };
+        changed(&app); // Discovery can block; publish busy before any CLI work.
+        let root = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
+        let found = keyzapper_core::hermes::cli::discover(root.as_deref());
+        inputs.diagnostics = found.diagnostics;
+        inputs.targets = found.executables.iter().flat_map(|executable| found.homes.iter().map(move |home| {
+            keyzapper_core::hermes::HermesTarget { executable: executable.clone(), home: home.clone(), display_name: home.file_name().unwrap_or_default().to_string_lossy().into_owned() }
+        })).collect();
+        let _ = operation.refresh(&keyzapper_core::hermes::cli::HermesCli::new(), &inputs, |_| changed(&app));
+        view(&app)
+    }).await
+}
+
+#[tauri::command]
+async fn hermes_preview(
+    app: AppHandle,
+    action: String,
+    target: keyzapper_core::hermes::HermesTarget,
+    selection: Option<keyzapper_core::hermes::HermesSelection>,
+) -> Result<HermesPreview, String> {
+    blocking(move || {
+        let action = HermesAction::parse(&action)?;
+        let (operation, inputs) = hermes_inputs(&app)?;
+        operation.preview(&keyzapper_core::hermes::cli::HermesCli::new(), &inputs, action, &target, selection, std::time::Instant::now(), |_| changed(&app))
+    }).await
+}
+
+#[tauri::command]
+async fn hermes_connect(app: AppHandle, selection: keyzapper_core::hermes::HermesSelection, confirmation_id: String) -> Result<View, String> {
+    hermes_apply(app, HermesAction::Connect, selection.target.clone(), Some(selection), confirmation_id).await
+}
+
+async fn hermes_apply(app: AppHandle, action: HermesAction, target: keyzapper_core::hermes::HermesTarget, selection: Option<keyzapper_core::hermes::HermesSelection>, confirmation_id: String) -> Result<View, String> {
+    blocking(move || {
+        let (operation, inputs) = hermes_inputs(&app)?;
+        operation.apply(&keyzapper_core::hermes::cli::HermesCli::new(), &inputs, action, &target, selection, &confirmation_id, std::time::Instant::now(), |_| changed(&app))?;
+        Ok(view(&app))
+    }).await
+}
+
+#[tauri::command]
+async fn hermes_disconnect(app: AppHandle, target: keyzapper_core::hermes::HermesTarget, confirmation_id: String) -> Result<View, String> {
+    hermes_apply(app, HermesAction::Disconnect, target, None, confirmation_id).await
+}
+
+#[tauri::command]
+async fn hermes_recover(app: AppHandle, target: keyzapper_core::hermes::HermesTarget, confirmation_id: String) -> Result<View, String> {
+    hermes_apply(app, HermesAction::Recover, target, None, confirmation_id).await
+}
 
 #[tauri::command]
 fn translations() -> HashMap<String, String> {
@@ -1037,6 +1107,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             translations,
+            hermes_refresh,
+            hermes_preview,
+            hermes_connect,
+            hermes_disconnect,
+            hermes_recover,
             get_view,
             refresh_all,
             dismiss_notice,

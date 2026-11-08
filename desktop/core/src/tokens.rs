@@ -19,6 +19,9 @@ pub struct TokenSet {
     /// Kind of `access_token`; a profile whose token type changed never gets the old kind.
     #[serde(default, skip_serializing_if = "OidcTokenType::is_access")]
     pub token_type: OidcTokenType,
+    /// Whether `expires_at` came from a positive `expires_in` or a future JWT `exp` claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_verified: Option<bool>,
 }
 
 /// SSO tokens by profile ID in `sso-tokens.json` next to `keys.json`, same protection (owner-only file).
@@ -76,5 +79,19 @@ impl TokenStore {
         }
         let text = serde_json::to_string_pretty(tokens).map_err(|e| Error::KeyStore(e.to_string()))?;
         paths::write_atomic(&self.file, text.as_bytes(), true).map_err(|e| Error::KeyStore(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenSet;
+
+    #[test]
+    fn missing_expiry_provenance_defaults_to_unverified_and_is_omitted() {
+        let mut legacy = serde_json::from_str::<TokenSet>(r#"{"refreshToken":"R","accessToken":"A","expiresAt":1000}"#).unwrap();
+        assert_eq!(legacy.expiry_verified, None);
+        assert!(serde_json::to_value(&legacy).unwrap().get("expiryVerified").is_none());
+        legacy.expiry_verified = Some(false);
+        assert_eq!(serde_json::to_value(&legacy).unwrap()["expiryVerified"], false);
     }
 }

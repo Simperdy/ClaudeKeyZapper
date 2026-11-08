@@ -24,7 +24,12 @@ fn now() -> i64 {
 
 /// `2026-10-06T08:15:30Z` (no fractional seconds: the macOS app's ISO 8601 decoder rejects them).
 pub fn iso8601_utc() -> String {
-    let (y, mo, d, h, mi, s) = civil(now());
+    iso8601_utc_at(now())
+}
+
+/// Formats supplied Unix seconds as an ISO-8601 UTC timestamp.
+pub fn iso8601_utc_at(seconds: i64) -> String {
+    let (y, mo, d, h, mi, s) = civil(seconds);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
@@ -47,5 +52,11 @@ mod tests {
         assert_eq!(super::civil(0), (1970, 1, 1, 0, 0, 0));
         assert_eq!(super::civil(1_790_000_000), (2026, 9, 21, 14, 13, 20));
         assert_eq!(super::civil(951_782_400), (2000, 2, 29, 0, 0, 0));
+    }
+
+    #[test]
+    fn formats_supplied_epoch_without_reading_clock() {
+        assert_eq!(super::iso8601_utc_at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::iso8601_utc_at(951_782_400), "2000-02-29T00:00:00Z");
     }
 }

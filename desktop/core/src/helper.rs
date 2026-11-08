@@ -65,7 +65,9 @@ impl HelperCommand {
 
     pub fn run(&self, args: &[String], stdin: impl FnOnce() -> String) -> Output {
         let commands = ["credential", "pool", "store", "status", "delete"];
-        if args.len() != 3 || args[1] != "--profile" || !commands.contains(&args[0].as_str()) {
+        let json_mode = args.len() == 4 && args[0] == "credential" && args[1] == "--profile" && args[3] == "--json";
+        let legacy_mode = args.len() == 3 && args[1] == "--profile" && commands.contains(&args[0].as_str());
+        if !json_mode && !legacy_mode {
             return fail(ExitCode::Usage, l!("Aufruf: %@ credential|pool|store|status|delete --profile <UUID>", EXECUTABLE_NAME));
         }
         let Some(id) = parse_id(&args[2]) else { return fail(ExitCode::UnknownProfile, l!("Ungültige Profil-ID: %@", args[2])) };
@@ -79,12 +81,28 @@ impl HelperCommand {
             }
             return fail(ExitCode::UnknownProfile, l!("Unbekanntes Profil: %@", id));
         };
+        if json_mode && profile.is_subscription() {
+            return fail(ExitCode::Usage, "Claude subscription profiles do not provide gateway credentials.".into());
+        }
         if ["credential", "pool", "store"].contains(&args[0].as_str()) && !is_secure_endpoint(&profile.endpoint) {
             return fail(ExitCode::ConfigError, l!("Der Endpunkt %@ verwendet kein https. Keys werden nur verschlüsselt übertragen (http nur für localhost).", profile.endpoint));
         }
         if ["credential", "pool", "store"].contains(&args[0].as_str()) && !self.config.is_endpoint_allowed(&profile.endpoint) {
             let host = host_of(&profile.endpoint).unwrap_or_else(|| "?".into());
             return fail(ExitCode::ConfigError, l!("Endpunkt %@ ist laut Firmenrichtlinie (AllowedGatewayHosts) nicht freigegeben.", host));
+        }
+        if json_mode {
+            if profile.is_sso() {
+                return oidc::gateway_credential(profile, &self.tokens, oidc::unix_now())
+                    .map(|credential| ok(serde_json::json!({
+                        "access_token": credential.token,
+                        "expiry": crate::time::iso8601_utc_at(credential.expires_at),
+                    }).to_string()))
+                    .unwrap_or_else(|e| fail(exit_code(&e), e.to_string()));
+            }
+            return self.store.read(&profile.id)
+                .map(|token| ok(serde_json::json!({"access_token": token}).to_string()))
+                .unwrap_or_else(|e| fail(exit_code(&e), e.to_string()));
         }
         if profile.is_sso() {
             return self.run_sso(&args[0], profile);

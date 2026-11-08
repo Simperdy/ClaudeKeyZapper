@@ -147,10 +147,23 @@ fn token_response(profile_id: &str, kind: OidcTokenType, status: u16, json: &Val
         return Err(fail(l!("Kein Refresh-Token erhalten. Bei Entra ID muss der Scope „offline_access“ enthalten sein.")));
     };
     let expires_at = match kind {
-        OidcTokenType::Access => now + json.get("expires_in").and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(3600),
-        OidcTokenType::Id => jwt_exp(&token).ok_or_else(|| fail(l!("Das ID-Token enthält kein gültiges Ablaufdatum (exp).")))?,
+        OidcTokenType::Access => {
+            // An explicit numeric lifetime is authoritative even when it is <= 0: the token is
+            // already due (or expired), exactly as before. Only absent/unparseable metadata may
+            // fall back to the legacy one-hour cache, and both paths stay unverified for Hermes.
+            let declared = json.get("expires_in").and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+            match declared {
+                Some(seconds) if seconds > 0 => now.checked_add(seconds).map(|expiry| (expiry, true)),
+                Some(seconds) => Some((now.saturating_add(seconds), false)),
+                None => jwt_exp(&token).filter(|expiry| *expiry > now).map(|expiry| (expiry, true)),
+            }.unwrap_or_else(|| (now.saturating_add(3600), false))
+        }
+        OidcTokenType::Id => {
+            let expiry = jwt_exp(&token).filter(|expiry| *expiry > now).ok_or_else(|| fail(l!("Das ID-Token enthält kein gültiges zukünftiges Ablaufdatum (exp).")))?;
+            (expiry, true)
+        }
     };
-    Ok(TokenSet { refresh_token, access_token: Some(token), expires_at: Some(expires_at), token_type: kind })
+    Ok(TokenSet { refresh_token, access_token: Some(token), expires_at: Some(expires_at.0), token_type: kind, expiry_verified: Some(expires_at.1) })
 }
 
 /// Seconds an access token must stay valid to be handed out: Claude Code's helper TTL plus 60 s.
@@ -165,19 +178,41 @@ fn margin_secs(profile: &Profile) -> i64 {
     ttl_ms / 1000 + 60
 }
 
-fn cached(tokens: &TokenSet, kind: OidcTokenType, now: i64, margin: i64) -> Option<String> {
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayCredential {
+    pub token: String,
+    pub expires_at: i64,
+}
+
+fn cached(tokens: &TokenSet, kind: OidcTokenType, now: i64, margin: i64, require_verified_expiry: bool) -> Option<GatewayCredential> {
     match (&tokens.access_token, tokens.expires_at) {
-        (Some(token), Some(expires)) if tokens.token_type == kind && !token.is_empty() && expires - now > margin => Some(token.clone()),
+        (Some(token), Some(expires_at))
+            if tokens.token_type == kind
+                && !token.is_empty()
+                && expires_at - now > margin
+                && (!require_verified_expiry || tokens.expiry_verified == Some(true)) =>
+        {
+            Some(GatewayCredential { token: token.clone(), expires_at })
+        }
         _ => None,
     }
 }
 
-/// Bearer token for the gateway (access or ID token per profile): the cached one while it stays valid long enough, otherwise exactly one
-/// refresh grant (serialised across processes by a lock file; the store is re-read after taking the lock).
+/// Bearer token for the gateway (access or ID token per profile), with the expiry of that same token.
+/// Requires verified expiry metadata; nonconforming access-token providers are rejected rather than trusted to use the legacy one-hour fallback.
+pub fn gateway_credential(profile: &Profile, store: &TokenStore, now: i64) -> Result<GatewayCredential> {
+    credential(profile, store, now, true)
+}
+
+/// Legacy token-only lookup retains compatibility with cached records lacking expiry provenance.
 pub fn access_token(profile: &Profile, store: &TokenStore, now: i64) -> Result<String> {
+    credential(profile, store, now, false).map(|credential| credential.token)
+}
+
+fn credential(profile: &Profile, store: &TokenStore, now: i64, require_verified_expiry: bool) -> Result<GatewayCredential> {
     let (margin, kind) = (margin_secs(profile), profile.oidc_token_type);
-    if let Some(token) = store.read(&profile.id)?.as_ref().and_then(|t| cached(t, kind, now, margin)) {
-        return Ok(token);
+    if let Some(credential) = store.read(&profile.id)?.as_ref().and_then(|t| cached(t, kind, now, margin, require_verified_expiry)) {
+        return Ok(credential);
     }
     let config = config(profile)?;
     if let Some(dir) = store.file.parent() {
@@ -189,8 +224,8 @@ pub fn access_token(profile: &Profile, store: &TokenStore, now: i64) -> Result<S
     let Some(tokens) = store.read(&profile.id)?.filter(|t| !t.refresh_token.is_empty()) else {
         return Err(Error::SessionExpired(profile.id.clone()));
     };
-    if let Some(token) = cached(&tokens, kind, now, margin) {
-        return Ok(token);
+    if let Some(credential) = cached(&tokens, kind, now, margin, require_verified_expiry) {
+        return Ok(credential);
     }
     let discovery = discover(config.issuer)?;
     let (status, json) = post_form(
@@ -198,8 +233,15 @@ pub fn access_token(profile: &Profile, store: &TokenStore, now: i64) -> Result<S
         &[("grant_type", "refresh_token"), ("refresh_token", &tokens.refresh_token), ("client_id", config.client_id), ("scope", &config.scope)],
     )?;
     let fresh = token_response(&profile.id, kind, status, &json, Some(&tokens.refresh_token), now)?;
+    let result = GatewayCredential {
+        token: fresh.access_token.as_deref().ok_or_else(|| fail(l!("Die Antwort enthält kein Token.")))?.to_string(),
+        expires_at: fresh.expires_at.ok_or_else(|| fail(l!("Die Antwort enthält kein Ablaufdatum.")))?,
+    };
     store.write(&profile.id, &fresh)?;
-    Ok(fresh.access_token.unwrap_or_default())
+    if require_verified_expiry && fresh.expiry_verified != Some(true) {
+        return Err(fail(l!("Der Identity Provider lieferte kein verifiziertes Ablaufdatum. Bitte den OIDC-Anbieter konfigurieren, ein gültiges expires_in oder ein JWT exp zu liefern.")));
+    }
+    Ok(result)
 }
 
 /// Interactive sign-in. `open_browser` receives the authorization URL. Fails after `timeout`.
@@ -403,7 +445,7 @@ mod tests {
     }
 
     fn tokens(access: Option<&str>, expires_at: Option<i64>) -> TokenSet {
-        TokenSet { refresh_token: "R1".into(), access_token: access.map(String::from), expires_at, token_type: OidcTokenType::Access }
+        TokenSet { refresh_token: "R1".into(), access_token: access.map(String::from), expires_at, token_type: OidcTokenType::Access, expiry_verified: None }
     }
 
     /// Unsigned JWT with the given payload (KeyZapper only reads `exp`).
@@ -453,11 +495,116 @@ mod tests {
     }
 
     #[test]
+    fn credential_keeps_expiry_of_the_returned_cached_token() {
+        let (store, p) = (store(), profile("http://127.0.0.1:1"));
+        let mut cached = tokens(Some("A1"), Some(10_000));
+        cached.expiry_verified = Some(true);
+        store.write(&p.id, &cached).unwrap();
+        let c = gateway_credential(&p, &store, 1_000).unwrap();
+        assert_eq!(c.token, "A1");
+        assert_eq!(c.expires_at, 10_000);
+    }
+
+    #[test]
+    fn credential_returns_the_rotated_token_and_its_expiry() {
+        let (url, log) = idp(200, r#"{"access_token":"A2","refresh_token":"R2","expires_in":3600}"#);
+        let (store, p) = (store(), profile(&url));
+        store.write(&p.id, &tokens(Some("A1"), Some(1_100))).unwrap();
+        let c = gateway_credential(&p, &store, 1_000).unwrap();
+        assert_eq!((c.token.as_str(), c.expires_at), ("A2", 4_600));
+        assert_eq!(token_posts(&log), 1);
+    }
+
+    #[test]
+    fn credential_uses_future_id_token_exp_not_access_token_lifetime() {
+        let id = jwt(r#"{"exp":5000,"oid":"o1"}"#);
+        let (url, _) = idp(200, format!(r#"{{"access_token":"A2","id_token":"{id}","refresh_token":"R2","expires_in":3600}}"#));
+        let (store, mut p) = (store(), profile(&url));
+        p.oidc_token_type = OidcTokenType::Id;
+        store.write(&p.id, &tokens(None, None)).unwrap();
+        let c = gateway_credential(&p, &store, 1_000).unwrap();
+        assert_eq!((c.token.as_str(), c.expires_at), (id.as_str(), 5_000));
+    }
+
+    #[test]
+    fn concurrent_credentials_share_the_rotated_token_and_expiry() {
+        let (url, log) = idp(200, r#"{"access_token":"A2","refresh_token":"R2","expires_in":3600}"#);
+        let (store, p) = (store(), profile(&url));
+        store.write(&p.id, &tokens(Some("A1"), Some(1_100))).unwrap();
+        let (store2, p2) = (store.clone(), p.clone());
+        let first = std::thread::spawn(move || gateway_credential(&p, &store, 1_000).unwrap());
+        let second = std::thread::spawn(move || gateway_credential(&p2, &store2, 1_000).unwrap());
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!((first.token.as_str(), first.expires_at), ("A2", 4_600));
+        assert_eq!((first.token.as_str(), first.expires_at), (second.token.as_str(), second.expires_at));
+        assert_eq!(token_posts(&log), 1);
+    }
+
+    #[test]
+    fn strict_credentials_reject_unverified_fallback_expiry_but_legacy_access_token_keeps_it() {
+        let (url, log) = idp(200, r#"{"access_token":"A2","refresh_token":"R2"}"#);
+        let (store, p) = (store(), profile(&url));
+        store.write(&p.id, &tokens(Some("A1"), Some(10_000))).unwrap();
+        let err = match gateway_credential(&p, &store, 1_000) {
+            Err(err) => err,
+            Ok(_) => panic!("strict credentials must reject unverified expiry"),
+        };
+        assert!(matches!(err, Error::Oidc(_)));
+        assert!(!err.to_string().contains("A2") && !err.to_string().contains("R2"));
+        assert_eq!(token_posts(&log), 1);
+        let saved = store.read(&p.id).unwrap().unwrap();
+        assert_eq!(saved.expiry_verified, Some(false));
+        assert_eq!(access_token(&p, &store, 1_000).unwrap(), "A2");
+    }
+
+    #[test]
+    fn nonpositive_lifetime_never_becomes_a_future_legacy_cache() {
+        for lifetime in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!("0"), serde_json::json!("-1")] {
+            let response = serde_json::json!({"access_token":"opaque", "refresh_token":"synthetic-refresh", "expires_in":lifetime});
+            let (url, log) = idp(200, response.to_string());
+            let (store, p) = (store(), profile(&url));
+            store.write(&p.id, &tokens(None, None)).unwrap();
+            assert!(access_token(&p, &store, 1_000).is_ok());
+            assert!(store.read(&p.id).unwrap().unwrap().expires_at.unwrap() <= 1_000);
+            assert!(access_token(&p, &store, 1_001).is_ok());
+            assert_eq!(token_posts(&log), 2, "second legacy access must refresh");
+            assert!(gateway_credential(&p, &store, 1_002).is_err());
+            assert_eq!(token_posts(&log), 3);
+        }
+    }
+
+    #[test]
     fn margin_follows_helper_ttl() {
         let mut p = profile("http://127.0.0.1:1");
         assert_eq!(margin_secs(&p), 360);
         p.environment = Some([(TTL_ENV.to_string(), "60000".to_string())].into());
         assert_eq!(margin_secs(&p), 120);
+    }
+
+    #[test]
+    fn access_expiry_is_verified_only_from_positive_duration_or_future_jwt_exp() {
+        let valid = token_response("p", OidcTokenType::Access, 200, &serde_json::json!({"access_token":"opaque","refresh_token":"R","expires_in":60}), None, 1_000).unwrap();
+        assert_eq!((valid.expires_at, valid.expiry_verified), (Some(1_060), Some(true)));
+        for value in [serde_json::Value::Null, serde_json::json!("bad")] {
+            let mut response = serde_json::json!({"access_token":"opaque","refresh_token":"R"});
+            if !value.is_null() { response["expires_in"] = value; }
+            let saved = token_response("p", OidcTokenType::Access, 200, &response, None, 1_000).unwrap();
+            assert_eq!((saved.expires_at, saved.expiry_verified), (Some(4_600), Some(false)));
+        }
+        // Explicit non-positive lifetimes must not become a positive legacy cache.
+        for (value, expected) in [
+            (serde_json::json!(0), 1_000), (serde_json::json!("0"), 1_000),
+            (serde_json::json!(-1), 999), (serde_json::json!("-1"), 999),
+        ] {
+            let response = serde_json::json!({"access_token":"opaque","refresh_token":"R","expires_in":value});
+            let saved = token_response("p", OidcTokenType::Access, 200, &response, None, 1_000).unwrap();
+            assert_eq!((saved.expires_at, saved.expiry_verified), (Some(expected), Some(false)));
+        }
+        let future = jwt(r#"{"exp":5000}"#);
+        let response = serde_json::json!({"access_token":future,"refresh_token":"R","expires_in":"bad"});
+        let saved = token_response("p", OidcTokenType::Access, 200, &response, None, 1_000).unwrap();
+        assert_eq!((saved.expires_at, saved.expiry_verified), (Some(5_000), Some(true)));
     }
 
     #[test]

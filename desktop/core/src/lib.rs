@@ -13,6 +13,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod errors;
 pub mod gateway;
+pub mod hermes;
 pub mod git;
 pub mod helper;
 pub mod json;

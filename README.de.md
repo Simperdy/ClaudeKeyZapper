@@ -86,6 +86,8 @@ Helper-Caches (Standard 5 min), nach einem HTTP 401 oder nach einem Neustart.
 
 ## SSO-Profile
 
+KeyZapper bietet außerdem eine **experimentelle Hermes-Integration nur für exakt validierte Builds**; die macOS-/Firmenabnahme steht noch aus. Vor der Nutzung den [Hermes-Leitfaden zu Einrichtung, Wiederherstellung und Abnahme](docs/hermes-integration.md) lesen.
+
 Profile können sich über einen statischen LiteLLM-Key (Typ Key) oder per OIDC-Anmeldung (Typ SSO) authentifizieren.
 SSO erfordert einen OIDC-validierenden Proxy vor LiteLLM, der das Token (standardmäßig das Access-Token) prüft und den virtuellen Key in die Anfragen injiziert.
 
