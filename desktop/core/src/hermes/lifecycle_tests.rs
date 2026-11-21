@@ -7,27 +7,53 @@ use serde_json::json;
 const PROFILE: &str = "123E4567-E89B-12D3-A456-426614174000";
 struct Fake {
     fields: RefCell<BTreeMap<String, Value>>,
+    /// False once the config path no longer holds a readable file, as the real CLI would fail.
+    snapshot_ok: std::cell::Cell<bool>,
     writes: RefCell<usize>,
     fail_write: RefCell<Option<usize>>,
+    /// The confined config path the transport maintains, as the real CLI does.
+    file: RefCell<Option<PathBuf>>,
+    /// Set when a whole-file restore reached this transport.
+    restored: std::cell::Cell<bool>,
+    /// Overrides the raw bytes this fake reports as the file's current content.
+    raw_report: RefCell<Option<Vec<u8>>>,
+    /// Refuses a restore whose CAS expectation or bytes this fake's store would not produce.
+    last_restore: RefCell<Option<Vec<u8>>>,
 }
 impl Fake {
-    fn bytes(&self) -> Vec<u8> { serde_json::to_vec(&*self.fields.borrow()).unwrap() }
+    fn bytes(&self) -> Vec<u8> {
+        // A restore pinned different bytes: the raw config is now exactly what was restored.
+        if self.restored.get() { return self.last_restore.borrow().clone().unwrap_or_default(); }
+        serde_json::to_vec(&*self.fields.borrow()).unwrap()
+    }
     fn digest(&self) -> String { format!("{:x}", sha2::Sha256::digest(self.bytes())) }
     fn write(&self, key: &str, value: Option<&Value>) -> HermesResult<()> {
         *self.writes.borrow_mut() += 1;
         if *self.fail_write.borrow() == Some(*self.writes.borrow()) { return Err(HermesError::CliFailed); }
         if let Some(value) = value { self.fields.borrow_mut().insert(key.into(), value.clone()); }
         else { self.fields.borrow_mut().remove(key); }
+        self.persist();
         Ok(())
     }
+    fn persist(&self) { if let Some(path) = self.file.borrow().as_ref() { fs::write(path, self.bytes()).unwrap(); } }
 }
 impl ConfigAccess for Fake {
     fn snapshot(&self, target: &HermesTarget, keys: &[String]) -> HermesResult<ConfigSnapshot> {
-        Ok(ConfigSnapshot { config_path: target.home.join("config.yaml"), config_digest: self.digest(), fields: keys.iter().map(|key| (key.clone(), self.fields.borrow().get(key).cloned().map(StoredValue::Present).unwrap_or(StoredValue::Absent))).collect() })
+        if !self.snapshot_ok.get() { return Err(HermesError::CliFailed); }
+        Ok(ConfigSnapshot { config_path: target.home.join("config.yaml"), config_digest: format!("{:x}", sha2::Sha256::digest(self.raw_config(target)?.unwrap_or_default())), fields: keys.iter().map(|key| (key.clone(), self.fields.borrow().get(key).cloned().map(StoredValue::Present).unwrap_or(StoredValue::Absent))).collect() })
     }
-    fn raw_config(&self, _: &HermesTarget) -> HermesResult<Option<Vec<u8>>> { Ok(Some(self.bytes())) }
+    fn raw_config(&self, _: &HermesTarget) -> HermesResult<Option<Vec<u8>>> { Ok(Some(self.raw_report.borrow().clone().unwrap_or_else(|| self.bytes()))) }
     fn set(&self, _: &HermesTarget, key: &str, value: &Value) -> HermesResult<()> { self.write(key, Some(value)) }
     fn unset(&self, _: &HermesTarget, key: &str) -> HermesResult<()> { self.write(key, None) }
+    fn restore_raw_config(&self, _target: &HermesTarget, raw: &[u8], expected: &str) -> HermesResult<()> {
+        if format!("{:x}", sha2::Sha256::digest(self.raw_config(_target)?.unwrap_or_default())) != expected { return Err(HermesError::Conflict); }
+        // Same compare-and-swap shape as the CLI transport: validate, replace, update the pin.
+        if !serde_yaml_ng::from_slice::<Value>(raw).map_err(|_| HermesError::InvalidConfig)?.is_object() { return Err(HermesError::InvalidConfig); }
+        *self.last_restore.borrow_mut() = Some(raw.to_vec());
+        self.restored.set(true);
+        self.fields.borrow_mut().clear();
+        Ok(())
+    }
 }
 struct Fixture { root: PathBuf, target: HermesTarget, store: store::HermesStore, cli: Fake }
 impl Fixture {
@@ -36,7 +62,10 @@ impl Fixture {
         fs::create_dir_all(root.join("home")).unwrap();
         fs::write(root.join("hermes"), b"synthetic").unwrap();
         let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "fake".into() };
-        Self { store: store::HermesStore::new(root.join("store")), root, target, cli: Fake { fields: RefCell::new(BTreeMap::from([("providers.foreign".into(), json!({"unchanged":true})), ("model.default".into(), json!("original-model"))])), writes: RefCell::new(0), fail_write: RefCell::new(None) } }
+        let fixture = Self { store: store::HermesStore::new(root.join("store")), root, target, cli: Fake { snapshot_ok: std::cell::Cell::new(true), fields: RefCell::new(BTreeMap::from([("providers.foreign".into(), json!({"unchanged":true})), ("model.default".into(), json!("original-model"))])), writes: RefCell::new(0), fail_write: RefCell::new(None), file: RefCell::new(None), restored: Default::default(), raw_report: RefCell::new(None), last_restore: RefCell::new(None) } };
+        *fixture.cli.file.borrow_mut() = Some(fixture.target.home.join("config.yaml"));
+        fixture.cli.persist();
+        fixture
     }
     fn connect(&self, model: &str) -> HermesResult<()> {
         let selection = HermesSelection { target: self.target.clone(), profile_id: PROFILE.into(), model_id: model.into(), tenant: None };
@@ -173,6 +202,145 @@ fn lifecycle_artifacts_preparation_interruption_is_durable_before_and_after_back
 }
 
 #[test]
+fn lifecycle_restore_from_backup_after_third_party_edit_of_an_owned_key() {
+    // `Rollback` refuses (RollbackFailed) once someone else changed an owned key we wrote;
+    // `RestoreFromBackup` is the explicit path that replaces the file with the confirmed bytes.
+    let fx = Fixture::new();
+    let selection = HermesSelection { target: fx.target.clone(), profile_id: PROFILE.into(), model_id: "team/first".into(), tenant: None };
+    let profile = Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/first".into());
+    let mut plan = plan_connect(&fx.cli, selection, &profile, fx.root.join("keyzapper-helper").to_str().unwrap(), None, &ManagedConfig::default()).unwrap();
+    // Interrupted midway: the plan is pinned to the flat JSON the fake reports (production spells
+    // this YAML), so the pending file is exactly the bytes the user confirmed.
+    let document: BTreeMap<String, Value> = serde_json::from_slice(&fx.cli.bytes()).unwrap();
+    for key in recovery::OWNED_KEYS {
+        let (section, field) = key.split_once('.').unwrap();
+        let stored = document.get(section).and_then(|value| value.get(field)).cloned().map(StoredValue::Present).unwrap_or(StoredValue::Absent);
+        plan.snapshot.fields.insert(key.to_string(), stored.clone());
+        if let Some(change) = plan.changes.iter_mut().find(|change| change.key == key) { change.before = stored; }
+    }
+    plan.snapshot.config_digest = format!("{:x}", sha2::Sha256::digest(fx.cli.bytes()));
+    fx.store.save_raw_backup(&fx.target, &fx.cli.bytes()).unwrap();
+    fx.store.save_journal(&fx.key(), &store::Journal { plan, completed: Vec::new(), phase: Phase::Applying, operation: store::Operation::Connect }).unwrap();
+    // A third party then edits an owned key the interrupted operation was going to write.
+    let edited = "model.default";
+    fx.cli.write(edited, Some(&json!("third-party-value"))).unwrap();
+    let writes = *fx.cli.writes.borrow();
+    // The rollback validation refuses before any inverse write: the edit is neither the before
+    // nor the after value of an owned key the interrupted operation wrote.
+    let pending = fx.cli.digest();
+    assert_eq!(recover(&fx.cli, &fx.store, &fx.target, &pending, RecoveryAction::Rollback), Err(HermesError::RecoveryRequired));
+    // Restore is bound to the bytes the user confirmed, not to the edit.
+    let confirmed = fx.store.journal(&fx.key()).unwrap().unwrap().plan.snapshot.config_digest;
+    assert_eq!(recover(&fx.cli, &fx.store, &fx.target, "0".repeat(64).as_str(), RecoveryAction::RestoreFromBackup), Err(HermesError::Conflict));
+    assert!(!fx.cli.restored.get(), "a mismatched confirmation never reaches the transport");
+    assert_eq!(*fx.cli.writes.borrow(), writes, "a refused restore emits no write");
+    // A real transport only ever reports the digest of the bytes it holds, so the fake reports the
+    // backup re-spelled without whitespace: the same YAML document, so the same confirmation.
+    let current: BTreeMap<String, Value> = serde_yaml_ng::from_slice(&fx.store.raw_backup(&fx.target).unwrap()).unwrap();
+    *fx.cli.raw_report.borrow_mut() = Some(serde_json::to_vec(&current).unwrap());
+    recover(&fx.cli, &fx.store, &fx.target, &confirmed, RecoveryAction::RestoreFromBackup).unwrap();
+    assert!(fx.cli.restored.get(), "the validated backup replaced the whole file");
+    assert!(fx.store.owner(&fx.key()).unwrap().is_none(), "an interrupted first connect leaves no owner");
+    assert!(!fx.store.has_pending_operation().unwrap());
+    assert!(!fx.backup_exists());
+}
+
+#[test]
+fn lifecycle_restore_from_backup_needs_the_exact_confirmed_digest_and_the_matching_backup() {
+    let fx = Fixture::new();
+    fx.store.interrupt_on(StoreWrite::Cleanup, 1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.connect("team/first"))).is_err());
+    let writes = *fx.cli.writes.borrow();
+    let before = fx.cli.fields.borrow().clone();
+    // The lifecycle fake speaks flat JSON; production raw backups are YAML. Pin the journal to
+    // the exact YAML form of the same document, parsed into its fields, so the real recovery
+    // validation runs against the confirmable document rather than the fake's spelling.
+    let yaml = b"model:\n  provider: keyzapper\n  default: team/first\n  base_url: https://gateway.test\nproviders:\n  foreign:\n    unchanged: true\n";
+    let mut journal = fx.store.journal(&fx.key()).unwrap().unwrap();
+    journal.plan.snapshot.fields = ["model.provider", "model.default", "model.base_url"].map(|key| {
+        let (section, field) = key.split_once('.').unwrap();
+        let value = serde_yaml_ng::from_slice::<BTreeMap<String, serde_json::Map<String, Value>>>(yaml).unwrap()[section][field].clone();
+        (key.to_string(), StoredValue::Present(value))
+    }).into_iter().chain([("providers.keyzapper".to_string(), StoredValue::Absent)]).collect();
+    journal.plan.snapshot.config_digest = format!("{:x}", sha2::Sha256::digest(yaml));
+    fx.store.save_raw_backup(&fx.target, yaml).unwrap();
+    fx.store.save_journal(&fx.key(), &journal).unwrap();
+    let store_backup = |fx: &Fixture| fs::read_dir(fx.root.join("store/backups")).unwrap().flatten()
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "raw")).map(|entry| fs::read(entry.path()).unwrap());
+    assert_eq!(recovery::validate_backup(&journal, yaml), Ok(()), "the stored backup is the confirmed file");
+    assert_eq!(store_backup(&fx).as_deref(), Some(&yaml[..]));
+    // A backup that is no longer the confirmed bytes never authorizes a whole-file restore.
+    let mut tampered = yaml.to_vec();
+    tampered.extend_from_slice(b"  injected: true\n");
+    assert_eq!(recovery::validate_backup(&journal, &tampered), Err(HermesError::RecoveryRequired));
+    // A confirmation for different bytes is refused before anything is written.
+    let other_digest = format!("{:x}", sha2::Sha256::digest(&tampered));
+    assert_eq!(recover(&fx.cli, &fx.store, &fx.target, &other_digest, RecoveryAction::RestoreFromBackup), Err(HermesError::Conflict));
+    assert_eq!(*fx.cli.writes.borrow(), writes);
+    assert!(!fx.cli.restored.get());
+    assert!(matches!(fx.store.journal(&fx.key()).unwrap().unwrap().phase, Phase::CleanupPending), "a refused restore keeps the cleanup obligation");
+    let _ = before;
+}
+
+/// Re-point the pending journal at `yaml` (saved as the raw backup too) and make the fake
+/// report exactly that spelling as its digest, clearing every owned field it disagrees with.
+#[allow(dead_code)]
+fn pin_yaml(fx: &Fixture, yaml: &[u8]) -> (Vec<u8>, store::HermesStore) {
+    let mut journal = fx.store.journal(&fx.key()).unwrap().unwrap();
+    // `validate_backup` compares every owned field of the snapshot with the parsed backup, so the
+    // snapshot travels with the bytes the test pins.
+    let document = document_keys(yaml);
+    for key in recovery::OWNED_KEYS {
+        let stored = document.get(key).cloned().map(StoredValue::Present).unwrap_or(StoredValue::Absent);
+        journal.plan.snapshot.fields.insert(key.to_string(), stored);
+    }
+    journal.plan.snapshot.config_digest = format!("{:x}", sha2::Sha256::digest(yaml));
+    let pin = store::HermesStore::new(fx.root.join("store"));
+    pin.save_raw_backup(&fx.target, yaml).unwrap();
+    pin.save_journal(&fx.key(), &journal).unwrap();
+    *fx.cli.raw_report.borrow_mut() = Some(yaml.to_vec());
+    *fx.cli.last_restore.borrow_mut() = Some(yaml.to_vec());
+    (yaml.to_vec(), pin)
+}
+
+/// The confirmed document with its sections in a fixed order, so its digest is stable against
+/// the fake's own unordered JSON spelling while the bytes still differ from them.
+fn fixed(document: &BTreeMap<String, Value>) -> Vec<u8> {
+    serde_json::to_vec(document).unwrap()
+}
+
+/// Every top-level section's fields of a YAML map as `section.field` -> value.
+fn document_keys(yaml: &[u8]) -> BTreeMap<String, Value> {
+    serde_yaml_ng::from_slice::<BTreeMap<String, BTreeMap<String, Value>>>(yaml).unwrap_or_default()
+        .into_iter().flat_map(|(section, fields)| fields.into_iter().map(move |(field, value)| (format!("{section}.{field}"), value))).collect()
+}
+
+#[test]
+fn lifecycle_restore_from_backup_refuses_a_config_path_that_is_not_a_regular_file() {
+    let fx = Fixture::new();
+    fx.store.interrupt_on(StoreWrite::Cleanup, 1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fx.connect("team/first"))).is_err());
+    // Replace the committed config file with a directory: a non-regular file restore must refuse
+    // rather than replace it.
+    let path = fx.target.home.join("config.yaml");
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    // The fake reports a snapshot for any target even when its file is gone or not a file.
+    fx.cli.snapshot_ok.set(false);
+    let (_, pin) = pin_yaml(&fx, b"model:\n  provider: keyzapper\n  default: team/first\n  base_url: https://gateway.test\n");
+    let before = fx.cli.fields.borrow().clone();
+    let writes = *fx.cli.writes.borrow();
+    // The transport cannot read a directory, so recovery never reaches the replace step.
+    let digest = pin.journal(&fx.key()).unwrap().unwrap().plan.snapshot.config_digest;
+    assert!(recover(&fx.cli, &pin, &fx.target, &digest, RecoveryAction::RestoreFromBackup).is_err());
+    assert!(path.is_dir(), "a non-regular config is never replaced");
+    assert_eq!(*fx.cli.fields.borrow(), before);
+    assert_eq!(*fx.cli.writes.borrow(), writes);
+    assert!(!fx.cli.restored.get());
+    assert!(fx.backup_exists(), "the backup survives a refused restore");
+}
+
+#[test]
 fn lifecycle_artifacts_post_commit_interruption_keeps_atomic_owner_and_cleanup_marker() {
     for disconnecting in [false, true] {
         let fx = Fixture::new();
@@ -257,6 +425,8 @@ fn lifecycle_artifacts_real_unlink_error_keeps_cleanup_recoverable() {
     let writes = *fx.cli.writes.borrow();
     let owner = fx.store.owner(&fx.key()).unwrap();
     assert_eq!(recover(&fx.cli, &fx.store, &fx.target, &fx.cli.digest(), RecoveryAction::Rollback), Err(HermesError::JournalFailed));
+    // Restore refuses to overwrite the directory the backup slot now is.
+    assert_eq!(recover(&fx.cli, &fx.store, &fx.target, &fx.cli.digest(), RecoveryAction::RestoreFromBackup), Err(HermesError::JournalFailed));
     assert!(path.is_dir());
     assert!(matches!(fx.store.journal(&fx.key()).unwrap().unwrap().phase, Phase::CleanupPending));
     assert_eq!(inspect(&fx.cli, &fx.store, &fx.target), Ok(BindingHealth::RecoveryRequired));
@@ -390,6 +560,75 @@ fn lifecycle_pending_first_connect_without_owner_blocks_routing_identity_changes
     assert!(reopened.owner(&fx.key()).unwrap().is_none());
     assert!(!controller.has_pending_operation_for_profile(PROFILE).unwrap());
     assert!(controller.expect_unbound_for_routing_change(&old, &moved).is_ok(), "recovery releases the route");
+}
+
+#[test]
+fn lifecycle_controller_backup_restore_is_a_distinct_confirmed_recovery_action() {
+    struct Retarget<'a> { fake: &'a Fake, target: HermesTarget, restores: std::cell::Cell<usize> }
+    impl ConfigAccess for Retarget<'_> {
+        fn capability(&self, target: &HermesTarget) -> cli::Capability { assert_eq!(target, &self.target); cli::Capability::Supported }
+        fn snapshot(&self, target: &HermesTarget, keys: &[String]) -> HermesResult<ConfigSnapshot> {
+        assert_eq!(target, &self.target); self.fake.snapshot(target, keys) }
+        fn raw_config(&self, target: &HermesTarget) -> HermesResult<Option<Vec<u8>>> { self.fake.raw_config(target) }
+        fn set(&self, target: &HermesTarget, key: &str, value: &Value) -> HermesResult<()> { self.fake.set(target, key, value) }
+        fn unset(&self, target: &HermesTarget, key: &str) -> HermesResult<()> { self.fake.unset(target, key) }
+        fn restore_raw_config(&self, target: &HermesTarget, raw: &[u8], expected: &str) -> HermesResult<()> {
+            self.restores.set(self.restores.get() + 1);
+            assert_eq!(target, &self.target);
+            if format!("{:x}", sha2::Sha256::digest(self.fake.bytes())) != expected { return Err(HermesError::Conflict); }
+            // Replace the file exactly as the CLI transport does: raw bytes, mode, and digest.
+            *self.fake.last_restore.borrow_mut() = Some(raw.to_vec());
+            self.fake.restored.set(true);
+
+            Ok(())
+        }
+    }
+    let fx = Fixture::new();
+    // Simulate a process death after the first forward write but before progress was saved:
+    // the journal is `Applying`, the file already differs from the confirmed snapshot.
+    let selection = HermesSelection { target: fx.target.clone(), profile_id: PROFILE.into(), model_id: "team/first".into(), tenant: None };
+    let profile = Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/first".into());
+    let plan = plan_connect(&fx.cli, selection, &profile, fx.root.join("keyzapper-helper").to_str().unwrap(), None, &ManagedConfig::default()).unwrap();
+    let first = plan.changes.first().unwrap().clone();
+    fx.cli.write(&first.key, match &first.after { StoredValue::Present(value) => Some(value), StoredValue::Absent => None }).unwrap();
+    // The user-confirmed document, spelled exactly like the fake's raw config (production spells
+    // this YAML) so recovery can inspect the result it expects.
+    let backup = fixed(&serde_json::from_slice(&fx.cli.bytes()).unwrap());
+    fx.store.save_raw_backup(&fx.target, &backup).unwrap();
+    let mut plan = plan;
+    // The backup is flat JSON even though production raw config is YAML; the plan has to name
+    // exactly these bytes and their fields, or the restore would pass without writing anything.
+    plan.snapshot.config_digest = format!("{:x}", sha2::Sha256::digest(&backup));
+    let document: BTreeMap<String, Value> = serde_json::from_slice(&backup).unwrap();
+    for key in recovery::OWNED_KEYS {
+        let (section, field) = key.split_once('.').unwrap();
+        let stored = document.get(section).and_then(|value| value.get(field)).cloned().map(StoredValue::Present).unwrap_or(StoredValue::Absent);
+        plan.snapshot.fields.insert(key.to_string(), stored.clone());
+        if let Some(change) = plan.changes.iter_mut().find(|change| change.key == key) { change.before = stored; }
+    }
+    let pin = store::HermesStore::new(fx.root.join("store"));
+    pin.save_journal(&fx.key(), &store::Journal { plan, completed: Vec::new(), phase: Phase::Applying, operation: store::Operation::Connect }).unwrap();
+    let controller = controller::Controller::new(pin);
+    let access = Retarget { fake: &fx.cli, target: fx.target.clone(), restores: std::cell::Cell::new(0) };
+    let inputs = controller::Inputs {
+        profiles: vec![Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/first".into())],
+        policy: ManagedConfig::default(), disabled: false, helper: Some(fx.root.join("keyzapper-helper").to_string_lossy().into_owned()),
+        targets: vec![fx.target.clone()], diagnostics: vec![],
+    };
+    let preview = |action| controller.begin().unwrap().preview(&access, &inputs, action, &fx.target, None, std::time::Instant::now(), |_| {}).unwrap();
+    assert_eq!(preview(controller::Action::Recover).recovery_action, Some(RecoveryAction::Rollback));
+    assert_eq!(preview(controller::Action::RecoverFromBackup).recovery_action, Some(RecoveryAction::RestoreFromBackup));
+    // A confirmation issued for a plain rollback does not authorize the whole-file restore.
+    let rollback = preview(controller::Action::Recover);
+    let restore = preview(controller::Action::RecoverFromBackup);
+    let writes = *fx.cli.writes.borrow();
+    assert!(controller.begin().unwrap().apply(&access, &inputs, controller::Action::RecoverFromBackup, &fx.target, None, &rollback.confirmation_id, std::time::Instant::now(), |_| {}).is_err());
+    assert_eq!(access.restores.get(), 0, "a mismatched confirmation never reaches the transport");
+    controller.begin().unwrap().apply(&access, &inputs, controller::Action::RecoverFromBackup, &fx.target, None, &restore.confirmation_id, std::time::Instant::now(), |_| {}).unwrap();
+    assert_eq!(access.restores.get(), 1, "the confirmed restore went through the transport exactly once");
+    assert_eq!(*fx.cli.writes.borrow(), writes, "restore never emits per-key writes");
+    assert!(fx.cli.restored.get(), "the restore replaced the whole file instead of being skipped as a no-op");
+    assert!(!controller.store().has_pending_operation().unwrap());
 }
 
 #[test]

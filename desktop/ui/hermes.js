@@ -1,4 +1,4 @@
-const ACTIONS = Object.freeze({ connect: 'connect', disconnect: 'disconnect', recover: 'recover' });
+const ACTIONS = Object.freeze({ connect: 'connect', disconnect: 'disconnect', recover: 'recover', recoverFromBackup: 'recover_from_backup' });
 const targetKey = (target) => JSON.stringify([target?.executable, target?.home]);
 // An explicitly chosen tenant must be the exact `<tenant>/` prefix of the model ID. Never rewrite either value.
 const modelMatchesTenant = (modelId, tenant) => !tenant
@@ -35,13 +35,17 @@ export function createHermesController({ call, confirm, changed = () => {}, read
     const args = { action, target: entry.target, selection: selection ?? null };
     const proposal = await call('hermes_preview', args);
     if (!proposal?.confirmationId) throw new Error('Hermes preview unavailable.');
+    // A recovery confirmation names exactly one recovery action: the backend refuses a rollback
+    // confirmation for a whole-file restore and vice versa, so never substitute one for the other.
     const approved = await confirm({ action, target: entry.target, selection, preview: proposal });
     if (!approved) return false;
     const applied = action === ACTIONS.connect
       ? await call('hermes_connect', { selection, confirmationId: proposal.confirmationId })
       : action === ACTIONS.disconnect
         ? await call('hermes_disconnect', { target: entry.target, confirmationId: proposal.confirmationId })
-        : await call('hermes_recover', { target: entry.target, confirmationId: proposal.confirmationId });
+        : action === ACTIONS.recoverFromBackup
+          ? await call('hermes_recover_from_backup', { target: entry.target, confirmationId: proposal.confirmationId })
+          : await call('hermes_recover', { target: entry.target, confirmationId: proposal.confirmationId });
     if (!applied) throw new Error('Hermes operation failed.');
     const updatedHermes = applied.hermes;
     publish({ busy: false, error: null, status: updatedHermes?.health ?? 'configured', health: updatedHermes?.health ?? 'configured',
@@ -98,6 +102,13 @@ export function createHermesController({ call, confirm, changed = () => {}, read
       const target = snapshot.recoveryTarget ?? snapshot.selection?.target;
       if (!target) return Promise.resolve(false);
       return doAction(ACTIONS.recover, target, null);
+    },
+    // Whole-file restore of the confirmed backup: a distinct, separately confirmed recovery that
+    // replaces the file (including changes made outside KeyZapper) instead of inverting our writes.
+    recoverFromBackup() {
+      const target = snapshot.recoveryTarget ?? snapshot.selection?.target;
+      if (!target) return Promise.resolve(false);
+      return doAction(ACTIONS.recoverFromBackup, target, null);
     },
     async testConnection(paidConsent) {
       if (!paidConsent || snapshot.busy) return false;
@@ -168,6 +179,7 @@ export function hermesPage({ view, t, h, field, pageHeader, controller }) {
     h('button', { type: 'button', disabled: mutatingDisabled, onclick: () => controller.refresh() }, t('Installationen aktualisieren')),
     target && usableTargets.some((entry) => targetId(entry.target) === targetId(target)) && h('button', { type: 'button', disabled: mutatingDisabled, onclick: () => controller.connect(selectionFromDraft()) }, t(selected ? 'Hermes-Verbindung aktualisieren' : 'Hermes verbinden')),
     recoveryPending && h('button', { type: 'button', disabled: mutatingDisabled || !recoveryTargetSupported, onclick: () => controller.recover() }, t('Reparieren')),
+    recoveryPending && h('button', { type: 'button', disabled: mutatingDisabled || !recoveryTargetSupported || typeof controller.recoverFromBackup !== 'function', onclick: () => controller.recoverFromBackup() }, t('Aus Sicherung wiederherstellen')),
     selectedTargetSupported && state.health !== 'recoveryRequired' && state.health !== 'notConnected' && h('button', { type: 'button', disabled: mutatingDisabled, onclick: () => controller.disconnect() }, t('Entfernen')),
   ];
   const output = [pageHeader(t('Hermes'), t('Wähle ausdrücklich eine Installation, ein KeyZapper-Profil und ein Modell. Schreibzugriffe sind nur für die exakt validierte Installation verfügbar.'), ...actions),
@@ -183,6 +195,7 @@ export function hermesPage({ view, t, h, field, pageHeader, controller }) {
       recoveryTarget && !selected && h('div', { class: 'section-note' }, h('strong', null, t('Unterbrochene Hermes-Wiederherstellung')), h('p', null, t('Hermes-Ziel: %@', recoveryTarget.displayName)), h('p', { class: 'mono selectable' }, t('Hermes-Home: %@', recoveryTarget.home))),
       selected && !selectedTargetAvailable && h('p', { class: 'note red' }, t('Das gespeicherte Hermes-Ziel ist nicht verfügbar. Aktualisiere Installationen; es wurde kein anderes Ziel ausgewählt.')),
       recoveryPending && !recoveryTargetSupported && h('p', { class: 'note' }, t('Diese Hermes-Installation ist nicht validiert. Wiederherstellung bleibt sichtbar, aber gesperrt.')),
+      recoveryPending && recoveryTargetSupported && h('p', { class: 'note' }, t('„Reparieren“ macht nur die unvollständigen Änderungen dieser Sitzung rückgängig. „Aus Sicherung wiederherstellen“ ersetzt die ganze Konfigurationsdatei durch die bestätigte Sicherung und überschreibt dabei auch Änderungen außerhalb von KeyZapper.')),
       draft.target && !target && selectedTargetAvailable && h('p', { class: 'note red' }, t('Die ausgewählte Hermes-Installation ist nicht mehr verfügbar. Aktualisiere Installationen; es wurde kein Ersatz gewählt.')),
       field(t('Hermes-Installation'), selectControl(h, { value: draft.target, 'data-hermes-control': 'target', disabled: mutatingDisabled, onchange: (event) => onDraft('target', event.target.value, event) }, targetOptions), 'hermes-target'),
       field(t('KeyZapper-Profil'), selectControl(h, { value: draft.profileId, 'data-hermes-control': 'profile', disabled: mutatingDisabled, onchange: (event) => { draft = { ...draft, profileId: event.target.value, tenant: '' }; onDraft('profileId', event.target.value, event); } }, profileOptions), 'hermes-profile'),

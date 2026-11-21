@@ -47,7 +47,8 @@ impl Fixture {
         let target = HermesTarget { executable: root.join("hermes"), home: root.join("home"), display_name: "synthetic".into() };
         let selection = HermesSelection { target: target.clone(), profile_id: PROFILE.into(), model_id: "team/model".into(), tenant: None };
         let inputs = Inputs { profiles: vec![Profile::new(PROFILE.into(), "synthetic".into(), "https://gateway.test".into(), "team/model".into())], policy: ManagedConfig::default(), disabled: false, helper: Some(root.join("keyzapper-helper").to_str().unwrap().into()), targets: vec![target], diagnostics: vec![] };
-        Self { controller: Controller::new(HermesStore::new(root.join("store"))), inputs, selection, root, cli: Fake { fields: RefCell::new(BTreeMap::from([("model.default".into(), json!("original"))])), writes: RefCell::new(Vec::new()), before_write: RefCell::new(None) } }
+        let fixture = Self { controller: Controller::new(HermesStore::new(root.join("store"))), inputs, selection, root, cli: Fake { fields: RefCell::new(BTreeMap::from([("model.default".into(), json!("original"))])), writes: RefCell::new(Vec::new()), before_write: RefCell::new(None)} };
+        fixture
     }
 }
 impl Fixture {
@@ -484,11 +485,15 @@ fn controller_mixed_inventory_keeps_exact_supported_recovery_actionable_on_real_
     assert_eq!(fs::read(a.root.join("store/registry.json")).unwrap(), registry);
     assert!(a.cli.writes.borrow().is_empty());
     // Minimal seam: real serialized controller output feeds the actual JS page.
+    // The real page runs under Node; a run that never reaches an assertion must not look green.
     let output = std::process::Command::new("node")
         .args(["--test", "--test-name-pattern=controller mixed inventory", "../ui/tests/hermes.test.mjs"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("KEYZAPPER_HERMES_CONTROLLER_VIEW", serde_json::to_string(&view).unwrap()).output().unwrap();
     assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let page = String::from_utf8_lossy(&output.stdout);
+    let ran = page.lines().skip_while(|line| !line.starts_with("# tests")).next().and_then(|line| line.split_whitespace().nth(2).and_then(|n| n.parse::<usize>().ok()));
+    assert!(ran == Some(1) && page.contains("# fail 0"), "the real page test must run and pass, got:\n{page}");
     let preview = a.controller.begin().unwrap().preview(&Mixed(&a, &recorded), &a.inputs, Action::Recover, &a.selection.target, None, Instant::now(), |_| {}).unwrap();
     assert!(!preview.confirmation_id.is_empty());
     assert!(a.controller.begin().unwrap().preview(&Mixed(&a, &recorded), &a.inputs, Action::Recover, &b.selection.target, None, Instant::now(), |_| {}).is_err());

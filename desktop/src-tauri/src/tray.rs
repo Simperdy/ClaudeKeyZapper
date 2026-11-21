@@ -37,11 +37,15 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let icon = tauri::include_image!("icons/tray.png");
     #[cfg(not(target_os = "macos"))]
     let icon = tauri::include_image!("icons/tray-windows.png");
-    TrayIconBuilder::with_id(TRAY_ID)
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .icon_as_template(cfg!(target_os = "macos"))
-        .show_menu_on_left_click(false)
-        .tooltip("KeyZapper")
+        .show_menu_on_left_click(false);
+    // No tooltip on macOS: tray-icon covers the status-bar button with its own view that takes the mouse events, so
+    // AppKit never sees the pointer leave the button and the tooltip stays on screen.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.tooltip("KeyZapper");
+    builder
         .on_menu_event(|app, event| handle(app, event.id().as_ref()))
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, rect, .. } = event {
@@ -66,6 +70,7 @@ pub fn update(app: &AppHandle) {
         let Some(tray) = handle.tray_by_id(TRAY_ID) else { return };
         if let Ok(menu) = build_menu(&handle, &info) {
             let _ = tray.set_menu(Some(menu));
+            #[cfg(not(target_os = "macos"))]
             let _ = tray.set_tooltip(Some(tooltip(&info)));
             *shown = Some(info);
         }
@@ -87,6 +92,7 @@ fn budget_text(name: &str, (spend, max): (f64, Option<f64>)) -> String {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn tooltip(info: &TrayInfo) -> String {
     let attention = info.projects.iter().filter(|p| !p.healthy).count();
     if info.disabled {

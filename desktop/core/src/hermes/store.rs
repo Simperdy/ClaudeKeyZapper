@@ -8,7 +8,7 @@ pub enum Operation { Connect, Disconnect }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Journal { pub plan: super::binding::BindingPlan, pub completed: Vec<String>, pub phase: Phase, pub operation: Operation }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Phase { PreparingBackup, Prepared, Applying, Committed, RecoveryRequired, CleanupPending }
+pub enum Phase { PreparingBackup, Prepared, Applying, Committed, RecoveryRequired, CleanupPending, Restored }
 #[derive(Serialize, Deserialize, Default)]
 struct Registry { ownership: BTreeMap<String, Ownership>, journals: BTreeMap<String, Journal> }
 
@@ -90,7 +90,7 @@ impl HermesStore {
         #[cfg(test)] self.check_fault(StoreWrite::FinishCleanup)?;
         let _lock = self.lock_registry()?; let mut registry = self.read_registry()?;
         match registry.journals.get(key).map(|journal| journal.phase) {
-            Some(Phase::PreparingBackup | Phase::CleanupPending) => {},
+            Some(Phase::PreparingBackup | Phase::CleanupPending | Phase::Restored) => {},
             _ => return Err(HermesError::RecoveryRequired),
         }
         registry.journals.remove(key);

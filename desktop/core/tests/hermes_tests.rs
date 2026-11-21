@@ -20,9 +20,11 @@ struct FakeConfig {
     backup_to_observe: RefCell<Option<PathBuf>>,
     backup_seen_before_write: RefCell<bool>,
     after_write: RefCell<Option<Box<dyn Fn(&FakeConfig, usize)>>>,
+    /// The real transport keeps the file on disk; the full raw-config checks need it here too.
+    file: RefCell<Option<PathBuf>>,
 }
 impl FakeConfig {
-    fn new(values: BTreeMap<String, Value>) -> Self { Self { values: RefCell::new(values), calls: RefCell::new(Vec::new()), fail_write: RefCell::new(None), write_count: RefCell::new(0), backup_to_observe: RefCell::new(None), backup_seen_before_write: RefCell::new(false), after_write: RefCell::new(None) } }
+    fn new(values: BTreeMap<String, Value>) -> Self { Self { values: RefCell::new(values), calls: RefCell::new(Vec::new()), fail_write: RefCell::new(None), write_count: RefCell::new(0), backup_to_observe: RefCell::new(None), backup_seen_before_write: RefCell::new(false), after_write: RefCell::new(None), file: RefCell::new(None) } }
     fn fail_write_number(&self, n: usize) { *self.fail_write.borrow_mut() = Some(n); }
     fn all_stored(&self) -> BTreeMap<String, Value> { self.values.borrow().clone() }
     fn bytes(&self) -> Vec<u8> {
@@ -41,6 +43,7 @@ impl FakeConfig {
         if let Some(path) = self.backup_to_observe.borrow().as_ref() { *self.backup_seen_before_write.borrow_mut() = path.is_file(); }
         if *self.fail_write.borrow() == Some(*count) { return Err(HermesError::CliFailed); }
         if let Some(value) = value { self.values.borrow_mut().insert(key.into(), value.clone()); } else { self.values.borrow_mut().remove(key); }
+        if let Some(path) = self.file.borrow().as_ref() { fs::write(path, self.bytes()).unwrap(); }
         let number = *count;
         drop(count);
         if let Some(hook) = self.after_write.borrow().as_ref() { hook(self, number); }
@@ -99,6 +102,8 @@ impl Fixture {
         let key = HermesStore::target_key(&target).unwrap();
         let backup_hash = format!("{:x}", sha2::Sha256::digest(key.as_bytes()));
         *cli.backup_to_observe.borrow_mut() = Some(root.join(format!("private-store/backups/{backup_hash}.raw")));
+        *cli.file.borrow_mut() = Some(target.home.join("config.yaml"));
+        fs::write(target.home.join("config.yaml"), cli.bytes()).unwrap();
         Self { root, cli, store, target }
     }
     fn selection(&self, model_id: &str) -> HermesSelection { let mut s = selection(ALPHA); s.target = self.target.clone(); s.model_id = model_id.into(); s }
@@ -927,4 +932,28 @@ fn plan_connect_rejects_a_model_that_does_not_match_the_explicit_tenant() {
     assert_eq!(plan.selection.model_id, "team/sonnet");
     assert!(plan.changes.iter().any(|change| change.key == "model.default"
         && matches!(&change.after, StoredValue::Present(value) if value == &json!("team/sonnet"))));
+}
+
+// Review finding B: the per-key check alone cannot see edits to unmanaged keys, so `apply_changes`
+// re-checks the FULL raw digest before every write and after the last one. Only the file moves
+// that digest: the fake's in-memory values are mutated in place by the interruption hooks.
+#[test]
+fn lifecycle_concurrent_unmanaged_edit_before_first_write_aborts_and_keeps_the_edit() {
+    let fx = Fixture::new();
+    connect(&fx.cli, &fx.store, fx.selection("team/team"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &current_digest(&fx.cli, &fx.target)).unwrap();
+    let key = HermesStore::target_key(&fx.target).unwrap();
+    let path = fx.target.home.join("config.yaml");
+    // Another editor rewrites the file with a key the plan never mentions just before our first
+    // write. The transport's read-modify-write keeps that key; the raw digest no longer matches
+    // and the plan (which never mentioned the key) must not be reported as written.
+    let mut edited: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edited["providers"]["third-party"] = json!({"base_url": "https://third.example.test"});
+    let edited = serde_json::to_vec(&edited).unwrap();
+    fs::write(&path, &edited).unwrap();
+    let result = connect(&fx.cli, &fx.store, fx.selection("team/next"), &profile(ALPHA), HELPER, &ManagedConfig::default(), &format!("{:x}", sha2::Sha256::digest(&edited)));
+    let stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(stored["providers"]["third-party"], json!({"base_url": "https://third.example.test"}), "the concurrent unmanaged edit survives");
+    assert_ne!(result, Ok(()), "a file changed under the operation is never reported as a clean write");
+    assert!(fx.store.owner(&key).unwrap().unwrap().last_written["model.default"] == StoredValue::Present(json!("team/team")), "the committed owner still names the previous connect");
+    fs::remove_dir_all(fx.root).unwrap();
 }

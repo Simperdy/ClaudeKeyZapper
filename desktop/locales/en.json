@@ -179,6 +179,7 @@
  "Das Gateway hat die Anfrage abgelehnt (HTTP %@): %@": "The gateway rejected the request (HTTP %@): %@",
  "Das Gateway hat eine leere Antwort geliefert.": "The gateway returned an empty response.",
  "Das Gateway hat keine Modelle für diesen Key gemeldet.": "The gateway reported no models for this key.",
+ "Das Gateway lehnt den SSO-Zugang ab (HTTP 401/403). Die Anmeldung bleibt bestehen – Freigabe für Gateway und Modell prüfen oder im Profilmenü „Neu anmelden“ wählen.": "The gateway refuses SSO access (HTTP 401/403). You stay signed in – check the grant for gateway and model, or choose “Sign in again” in the profile menu.",
  "Das Gateway meldet keine Modelle für den Tenant „%@“.": "The gateway reports no models for tenant “%@”.",
  "Das ID-Token enthält kein gültiges Ablaufdatum (exp).": "The ID token has no valid expiry (exp).",
  "Das ID-Token enthält kein gültiges zukünftiges Ablaufdatum (exp).": "The ID token has no valid future expiry (exp).",
@@ -527,6 +528,7 @@
  "Neuer Schalter „Beta-Versionen“ in der Seitenleiste: Ist er an, bietet die Update-Suche auch Beta-Versionen an.": "New “Beta versions” switch in the sidebar: when it is on, the update check offers beta versions too.",
  "Neuer Server": "New server",
  "Neues Design: Seitenleiste, Budgetbalken mit Ampel, Projektstatus auf einen Blick mit „Alle reparieren“ – und Projektordner einfach auf ein Profil ziehen.": "New design: sidebar, budget bars with traffic-light colors, project status at a glance with “Repair all” – and project folders simply dragged onto a profile.",
+ "Neues Design: ruhigere Farben, größere Schaltflächen und Eingabefelder, je Ansicht eine klare Hauptaktion; die Aktionen an Projekten sind jetzt immer sichtbar.": "New design: calmer colours, larger buttons and fields, one clear main action per view; project actions are now always visible.",
  "Neues Profil": "New profile",
  "Nicht angemeldet": "Not signed in",
  "Nicht angemeldet – Claude-Anfragen schlagen fehl. Beim Profil „Anmelden“ wählen.": "Not signed in – Claude requests will fail. Choose “Sign in” on the profile.",
@@ -599,6 +601,7 @@
  "SSO-Profile haben keinen Key und nehmen nicht am Budget-Killer-Pool teil.": "SSO profiles have no key and do not take part in the Budget-Killer pool.",
  "SSO-Profile unterstützen keinen Pool-Modus.": "SSO profiles do not support pool mode.",
  "SSO-Profile zeigen jetzt ihr verbleibendes Budget, z. B. an LiteLLM – ohne eigenen Key das Budget des angemeldeten Nutzers.": "SSO profiles now show their remaining budget, e.g. on LiteLLM – without a key of their own, the signed-in user's budget.",
+ "SSO-Profile: „Verbindung prüfen“ meldet nicht mehr ab, wenn das Gateway den Zugang ablehnt (401/403) – die Meldung sagt jetzt, dass die Freigabe fehlt.": "SSO profiles: “Check connection” no longer signs you out when the gateway refuses access (401/403) – the message now says the grant is missing.",
  "Schließen": "Close",
  "Schließt du das Fenster, läuft KeyZapper im Infobereich der Taskleiste weiter: Klick aufs Symbol zeigt Abo-Verbrauch und Budgets, Rechtsklick wechselt Profile je Projekt.": "When you close the window, KeyZapper keeps running in the notification area: click the icon for subscription usage and budgets, right-click to switch profiles per project.",
  "Schließt du das Fenster, läuft KeyZapper in der Menüleiste weiter: Klick aufs Symbol zeigt Abo-Verbrauch und Budgets, Rechtsklick wechselt Profile je Projekt.": "When you close the window, KeyZapper keeps running in the menu bar: click the icon for subscription usage and budgets, right-click to switch profiles per project.",
@@ -739,5 +742,11 @@
  "„env“ ist kein Objekt; Claude Code erwartet Name-Wert-Paare.": "“env” is not an object; Claude Code expects name-value pairs.",
  "„mcpServers“ fehlt.": "“mcpServers” is missing.",
  "„model“ ist die feste Modell-ID „%@“. Über ein Gateway mit eigenen Namen besser einen Alias wählen (opus, sonnet, haiku), damit die Profilmodelle greifen.": "“model” is the fixed model ID “%@”. With a gateway using its own names, better choose an alias (opus, sonnet, haiku) so the profile models apply.",
- "→ Bedrock": "→ Bedrock"
+ "→ Bedrock": "→ Bedrock",
+ "Replace the Hermes configuration on %@ with the saved backup, including any changes made outside KeyZapper.": "Replace the Hermes configuration on %@ with the saved backup, including any changes made outside KeyZapper.",
+ "The interrupted Hermes operation had not written the configuration yet; recover it.": "The interrupted Hermes operation had not written the configuration yet; recover it.",
+ "Aus Sicherung wiederherstellen": "Restore from backup",
+ "„Reparieren“ macht nur die unvollständigen Änderungen dieser Sitzung rückgängig. „Aus Sicherung wiederherstellen“ ersetzt die ganze Konfigurationsdatei durch die bestätigte Sicherung und überschreibt dabei auch Änderungen außerhalb von KeyZapper.": "“Repair” only reverts the incomplete changes of this session. “Restore from backup” replaces the whole configuration file with the confirmed backup and overwrites changes made outside KeyZapper too.",
+ "Hermes aus Sicherung wiederherstellen": "Restore Hermes from backup",
+ "Hermes ersetzt die gesamte Hermes-Konfiguration am Ziel %@ durch die bestätigte Sicherung. Änderungen außerhalb von KeyZapper gehen dabei verloren.": "Hermes replaces the whole Hermes configuration on %@ with the confirmed backup. Changes made outside KeyZapper are lost."
 }

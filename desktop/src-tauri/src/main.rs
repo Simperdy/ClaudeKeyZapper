@@ -390,6 +390,13 @@ async fn hermes_recover(app: AppHandle, target: keyzapper_core::hermes::HermesTa
     hermes_apply(app, HermesAction::Recover, target, None, confirmation_id).await
 }
 
+/// Whole-file restore of the confirmed backup. Its own command (and confirmation) so a rollback
+/// confirmation can never be replayed as a restore.
+#[tauri::command]
+async fn hermes_recover_from_backup(app: AppHandle, target: keyzapper_core::hermes::HermesTarget, confirmation_id: String) -> Result<View, String> {
+    hermes_apply(app, HermesAction::RecoverFromBackup, target, None, confirmation_id).await
+}
+
 #[tauri::command]
 fn translations() -> HashMap<String, String> {
     keyzapper_core::i18n::english().clone()
@@ -526,9 +533,10 @@ async fn test_connection(app: AppHandle, profile_id: String) -> Result<CheckOutc
             Err(message) => return Err(message),
         };
         let result = gateway::run(&endpoint, &key, &models);
+        // The token was just fetched or refreshed, so the session is valid: a 401/403 means the gateway refuses
+        // this user or model. Report it, but keep the profile signed in (a test must not sign anyone out).
         if sso && result == CheckResult::Unauthorized {
-            with_model(&app, |m| m.sso_expired.insert(profile_id.clone()));
-            return Ok(CheckOutcome { success: false, message: l!("Kein aktiver Zugang – Sitzung abgelaufen, bitte neu anmelden.") });
+            return Ok(CheckOutcome { success: false, message: l!("Das Gateway lehnt den SSO-Zugang ab (HTTP 401/403). Die Anmeldung bleibt bestehen – Freigabe für Gateway und Modell prüfen oder im Profilmenü „Neu anmelden“ wählen.") });
         }
         refresh_budgets(&app, Some(&profile_id));
         Ok(CheckOutcome { success: result.is_success(), message: result.message() })
@@ -563,7 +571,7 @@ async fn available_models(app: AppHandle, endpoint: String, typed_key: String, p
         match gateway::models(&endpoint, &key) {
             Ok(models) if models.is_empty() => Err(l!("Das Gateway hat keine Modelle für diesen Key gemeldet.")),
             Ok(models) => Ok(models),
-            Err(CheckResult::Unauthorized) if sso => Err(l!("Kein aktiver Zugang – Sitzung abgelaufen, bitte neu anmelden.")),
+            Err(CheckResult::Unauthorized) if sso => Err(l!("Das Gateway lehnt den SSO-Zugang ab (HTTP 401/403). Die Anmeldung bleibt bestehen – Freigabe für Gateway und Modell prüfen oder im Profilmenü „Neu anmelden“ wählen.")),
             Err(failure) => Err(failure.message()),
         }
     })
@@ -731,10 +739,7 @@ async fn generate_agents_file(app: AppHandle, binding_id: String, options: agent
         let (profile, path, key) = with_model(&app, |m| m.analysis_access(&binding_id))?;
         let available = match gateway::models(&profile.endpoint, &key) {
             Ok(models) => models,
-            Err(CheckResult::Unauthorized) if profile.is_sso() => {
-                with_model(&app, |m| m.sso_expired.insert(profile.id.clone()));
-                return Err(l!("Kein aktiver Zugang – Sitzung abgelaufen, bitte neu anmelden."));
-            }
+            Err(CheckResult::Unauthorized) if profile.is_sso() => return Err(l!("Das Gateway lehnt den SSO-Zugang ab (HTTP 401/403). Die Anmeldung bleibt bestehen – Freigabe für Gateway und Modell prüfen oder im Profilmenü „Neu anmelden“ wählen.")),
             Err(failure @ (CheckResult::Unauthorized | CheckResult::BudgetExceeded | CheckResult::Unreachable(_))) => return Err(failure.message()),
             // Some gateways do not list models; the analysis call can still work.
             Err(_) => vec![],
@@ -1112,6 +1117,7 @@ fn main() {
             hermes_connect,
             hermes_disconnect,
             hermes_recover,
+            hermes_recover_from_backup,
             get_view,
             refresh_all,
             dismiss_notice,

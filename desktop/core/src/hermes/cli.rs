@@ -313,6 +313,28 @@ impl ConfigAccess for HermesCli {
         if !allowed_key(key) { return Err(HermesError::PolicyDenied); }
         self.run_write(target, vec!["config".into(), "unset".into(), key.into()])
     }
+    /// Recovery only: write the already-validated raw backup back through the same verified
+    /// installation and the same confined config path the rest of this transport uses. The
+    /// write is a compare-and-swap on the current file digest (re-checked immediately before the
+    /// atomic replace), follow-me semantics for a symlinked config, and keeps its permissions.
+    #[cfg(unix)]
+    fn restore_raw_config(&self, target: &HermesTarget, raw: &[u8], expected_digest: &str) -> HermesResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        self.check_write(target)?;
+        let path = self.path(target)?;
+        let current = match fs::read(&path) { Ok(bytes) => bytes, Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(), Err(_) => return Err(HermesError::InvalidConfig) };
+        if format!("{:x}", Sha256::digest(&current)) != expected_digest { return Err(HermesError::Conflict); }
+        let parsed: Value = if raw.is_empty() { Value::Object(Default::default()) } else { serde_yaml_ng::from_slice(raw).map_err(|_| HermesError::InvalidConfig)? };
+        if !parsed.is_object() { return Err(HermesError::InvalidConfig); }
+        // Replacing a symlink would unlink the user's link; write through to its target instead.
+        let destination = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let mode = fs::metadata(&destination).ok().map(|meta| meta.permissions().mode());
+        crate::paths::write_atomic(&destination, raw, false).map_err(|_| HermesError::RecoveryRequired)?;
+        if let Some(mode) = mode { fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).map_err(|_| HermesError::RecoveryRequired)?; }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    fn restore_raw_config(&self, _target: &HermesTarget, _raw: &[u8], _expected_digest: &str) -> HermesResult<()> { Err(HermesError::Unsupported) }
 }
 fn allowed_key(key: &str) -> bool {
     matches!(key, "providers.keyzapper" | "model.provider" | "model.default" | "model.base_url")

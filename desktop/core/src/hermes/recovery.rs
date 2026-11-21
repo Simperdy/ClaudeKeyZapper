@@ -37,10 +37,22 @@ pub(super) fn validate_owner(owner: &Ownership, target: &HermesTarget) -> Hermes
     Ok(())
 }
 
+/// The canonical path `path` must occupy inside `target.home`; a path already inside that
+/// directory is normalized lexically so a non-regular file (a FIFO cannot be canonicalized
+/// without blocking) is still judged by its own path rather than rejected as a foreign target.
 pub(super) fn config_path(path: &Path, target: &HermesTarget) -> HermesResult<PathBuf> {
     let home = fs::canonicalize(&target.home).map_err(|_| HermesError::WrongTarget)?;
-    let resolved = if path.exists() { fs::canonicalize(path).map_err(|_| HermesError::WrongTarget)? }
-        else { fs::canonicalize(path.parent().ok_or(HermesError::WrongTarget)?).map_err(|_| HermesError::WrongTarget)?.join(path.file_name().ok_or(HermesError::WrongTarget)?) };
+    // Resolve symlinks for regular files; a non-regular entry (a FIFO cannot be canonicalized
+    // without blocking) is judged by its own lexical path inside the home instead.
+    let inside = |candidate: &Path| candidate.starts_with(&home) && !candidate.components().any(|part| matches!(part, std::path::Component::ParentDir));
+    let regular = |candidate: &Path| fs::symlink_metadata(candidate).is_ok_and(|meta| meta.file_type().is_symlink() || meta.is_file());
+    let lexical = |candidate: &Path| match (candidate.file_name(), candidate.parent()) { (Some(name), Some(parent)) => Ok(parent.join(name)), _ => Err(HermesError::WrongTarget) };
+    let resolved = if path.exists() && regular(path) { fs::canonicalize(path).map_err(|_| HermesError::WrongTarget)? }
+        else {
+            let candidate = lexical(path)?;
+            if inside(&candidate) { candidate }
+            else { fs::canonicalize(candidate.parent().ok_or(HermesError::WrongTarget)?).map_err(|_| HermesError::WrongTarget)?.join(candidate.file_name().ok_or(HermesError::WrongTarget)?) }
+        };
     if !resolved.starts_with(home) { return Err(HermesError::WrongTarget); }
     Ok(resolved)
 }
@@ -92,6 +104,10 @@ pub(super) fn validate_cleanup_target(journal: &Journal, target: &HermesTarget) 
     Ok(())
 }
 
+/// Recovery may only restore bytes whose FULL content the user confirmed: the digest pins them to
+/// the snapshot, the bytes must be a YAML map, and every owned field must be what the snapshot
+/// recorded. Unmanaged keys are not restricted here — the digest already authorizes exactly
+/// these bytes, and `RestoreFromBackup` deliberately replaces the whole file.
 pub(super) fn validate_backup(journal: &Journal, raw: &[u8]) -> HermesResult<()> {
     if format!("{:x}", sha2::Sha256::digest(raw)) != journal.plan.snapshot.config_digest { return Err(HermesError::RecoveryRequired); }
     let parsed: serde_json::Value = if raw.is_empty() { serde_json::json!({}) }

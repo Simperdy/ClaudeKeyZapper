@@ -5,12 +5,23 @@ use serde::Serialize;
 use std::{sync::{Arc, Mutex}, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action { Connect, Disconnect, Recover }
+pub enum Action { Connect, Disconnect, Recover, RecoverFromBackup }
 impl Action {
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value { "connect" => Ok(Self::Connect), "disconnect" => Ok(Self::Disconnect), "recover" => Ok(Self::Recover), _ => Err("Unknown Hermes action.".into()) }
+        match value { "connect" => Ok(Self::Connect), "disconnect" => Ok(Self::Disconnect), "recover" => Ok(Self::Recover), "recover_from_backup" => Ok(Self::RecoverFromBackup), _ => Err("Unknown Hermes action.".into()) }
     }
-    fn name(self) -> &'static str { match self { Self::Connect => "connect", Self::Disconnect => "disconnect", Self::Recover => "recover" } }
+    fn name(self) -> &'static str { match self { Self::Connect => "connect", Self::Disconnect => "disconnect", Self::Recover => "recover", Self::RecoverFromBackup => "recover_from_backup" } }
+    fn recovery(self, phase: Option<super::store::Phase>) -> Option<RecoveryAction> {
+        match self {
+            // A `Prepared` journal may have touched no file at all, so there is no restore
+            // authority to offer; once writes were authorized both actions are confirmable.
+            Self::RecoverFromBackup if matches!(phase, Some(super::store::Phase::CleanupPending | super::store::Phase::Restored)) => Some(RecoveryAction::Rollback),
+            Self::RecoverFromBackup if matches!(phase, Some(super::store::Phase::Prepared)) => None,
+            Self::RecoverFromBackup => Some(RecoveryAction::RestoreFromBackup),
+            Self::Recover => Some(RecoveryAction::Rollback),
+            Self::Connect | Self::Disconnect => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,7 +43,15 @@ pub struct HermesView {
 pub struct HermesTargetView { pub target: HermesTarget, pub supported: bool }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Preview { pub summary: String, pub confirmation_id: String, pub expires_in_seconds: u64 }
+pub struct Preview {
+    pub summary: String,
+    pub confirmation_id: String,
+    pub expires_in_seconds: u64,
+    /// Present for recovery only: the UI must send exactly this action back, so a plain rollback
+    /// never becomes a whole-file restore and vice versa.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<RecoveryAction>,
+}
 
 /// Taken under the UI model lock AFTER acquiring an operation permit. No I/O here.
 pub struct Inputs {
@@ -127,7 +146,7 @@ impl Drop for Operation {
         state.view.busy = false;
     }
 }
-struct Prepared { digest: String, fingerprint: String, summary: String, selection: HermesSelection }
+struct Prepared { digest: String, fingerprint: String, summary: String, selection: HermesSelection, recovery: Option<RecoveryAction> }
 impl Operation {
     /// Read-only status, including recovery detection. Never calls recover.
     pub fn refresh(self, access: &dyn ConfigAccess, inputs: &Inputs, mut publish: impl FnMut(HermesView)) -> Result<(), String> {
@@ -235,7 +254,7 @@ impl Operation {
         let selected = match action {
             Action::Connect => selection.clone().ok_or_else(|| "Connect requires a selection.".to_string())?,
             Action::Disconnect => owner.as_ref().ok_or_else(|| "Hermes target is not connected.".to_string())?.selection.clone(),
-            Action::Recover => journal.as_ref().ok_or_else(|| "No interrupted Hermes operation needs recovery.".to_string())?.plan.selection.clone(),
+            Action::Recover | Action::RecoverFromBackup => journal.as_ref().ok_or_else(|| "No interrupted Hermes operation needs recovery.".to_string())?.plan.selection.clone(),
         };
         if &selected.target != target || selection.as_ref().is_some_and(|s| s != &selected) { return Err("Selection no longer matches the Hermes binding.".into()); }
         let profile = inputs.profiles.iter().find(|p| p.id == selected.profile_id);
@@ -252,10 +271,15 @@ impl Operation {
                 let keys = owner.as_ref().unwrap().last_written.keys().cloned().collect::<Vec<_>>();
                 (access.snapshot(target, &keys).map_err(error)?.config_digest, l!("Disconnect KeyZapper from Hermes %@ and restore its owned settings.", target.display_name))
             }
-            Action::Recover => {
+            Action::Recover | Action::RecoverFromBackup => {
                 let phase = journal.as_ref().unwrap().phase;
-                let summary = if matches!(phase, super::store::Phase::PreparingBackup | super::store::Phase::CleanupPending) {
+                if action == Action::RecoverFromBackup && matches!(phase, super::store::Phase::Prepared) {
+                    return Err(l!("The interrupted Hermes operation had not written the configuration yet; recover it."));
+                }
+                let summary = if matches!(phase, super::store::Phase::PreparingBackup | super::store::Phase::CleanupPending | super::store::Phase::Restored) {
                     l!("Clean up artifacts for the interrupted Hermes operation on %@.", target.display_name)
+                } else if action == Action::RecoverFromBackup {
+                    l!("Replace the Hermes configuration on %@ with the saved backup, including any changes made outside KeyZapper.", target.display_name)
                 } else { l!("Roll back the interrupted Hermes operation on %@.", target.display_name) };
                 (access.snapshot(target, &[]).map_err(error)?.config_digest, summary)
             }
@@ -263,7 +287,7 @@ impl Operation {
         // Private state participates only in this digest, never in a DTO or error.
         let context = serde_json::to_string(&(target, &selected, profile.map(|p| (&p.id, &p.endpoint, p.auth_type)), if action == Action::Connect { inputs.helper.as_deref() } else { None }, &inputs.policy.allowed_gateway_hosts, inputs.disabled, &owner, &journal)).map_err(|_| "Invalid Hermes confirmation context.".to_string())?;
         let fingerprint = service::confirmation_fingerprint(action.name(), &key, &digest, &context);
-        Ok(Prepared { digest, fingerprint, summary, selection: selected })
+        Ok(Prepared { digest, fingerprint, summary, selection: selected, recovery: action.recovery(journal.as_ref().map(|journal| journal.phase)) })
     }
     fn finish<T>(&self, result: &Result<T, String>, publish: &mut impl FnMut(HermesView)) {
         {
@@ -277,7 +301,7 @@ impl Operation {
         publish(self.controller.view());
         let result = self.prepare(access, inputs, action, target, selection).map(|prepared| {
             let confirmation_id = self.controller.shared.state.lock().unwrap_or_else(|e| e.into_inner()).confirmations.issue(action.name(), &prepared.fingerprint, now);
-            Preview { summary: prepared.summary, confirmation_id, expires_in_seconds: 60 }
+            Preview { summary: prepared.summary, confirmation_id, expires_in_seconds: 60, recovery_action: prepared.recovery }
         });
         self.finish(&result, &mut publish);
         result
@@ -295,8 +319,8 @@ impl Operation {
             match action {
                 Action::Connect => super::connect(access, self.controller.store(), prepared.selection.clone(), inputs.profiles.iter().find(|p| p.id == prepared.selection.profile_id).unwrap(), inputs.helper.as_deref().unwrap(), &inputs.policy, &prepared.digest),
                 Action::Disconnect => super::disconnect(access, self.controller.store(), target, &prepared.digest),
-                Action::Recover => super::recover(access, self.controller.store(), target, &prepared.digest, RecoveryAction::Rollback),
-            }.map_err(error)
+                Action::Recover | Action::RecoverFromBackup => super::recover(access, self.controller.store(), target, &prepared.digest, prepared.recovery.unwrap_or(RecoveryAction::Rollback)),
+            }.map_err(|error| format!("{error:?}"))
         })();
         let refreshed = self.read_view(access, inputs, Some(target));
         if result.is_ok() { result = refreshed; }

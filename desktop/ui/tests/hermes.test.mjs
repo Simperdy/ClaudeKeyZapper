@@ -118,6 +118,44 @@ test('configured Hermes status does not imply a successful paid test', async () 
   assert.equal(c.state.testStatus, 'notTested');
 });
 
+test('restore-from-backup is previewed and applied as its own action, never as a rollback', async () => {
+  const calls = [];
+  const pending = { ...target, home: '/home/user/.hermes-pending' };
+  const restorePreview = { ...preview, recoveryAction: 'restore_from_backup' };
+  const confirmations = [];
+  const c = createHermesController({
+    call: async (name, args) => {
+      calls.push([name, args]);
+      if (name === 'hermes_refresh') return { hermes: { targets: [{ target: pending, supported: true }], selected: null, recoveryTarget: pending, health: 'recoveryRequired' } };
+      if (name === 'hermes_preview') return restorePreview;
+      return { hermes: { targets: [{ target: pending, supported: true }], selected: null, recoveryTarget: null, health: 'configured' } };
+    }, confirm: async (details) => { confirmations.push(details); return true; },
+  });
+  await c.refresh();
+  assert.equal(await c.recoverFromBackup(), true);
+  assert.equal(calls[1][0], 'hermes_preview');
+  assert.deepEqual(calls[1][1], { action: 'recover_from_backup', target: pending, selection: null });
+  assert.equal(confirmations[0].action, 'recover_from_backup');
+  assert.deepEqual(calls[2], ['hermes_recover_from_backup', { target: pending, confirmationId: 'c-1' }]);
+  assert.equal(calls.some(([name]) => name === 'hermes_recover'), false, 'a restore never falls back to the rollback command');
+  assert.equal(c.state.recoveryTarget, null);
+});
+
+test('cancelled restore-from-backup confirmation never applies anything', async () => {
+  const calls = [];
+  const pending = { ...target, home: '/home/user/.hermes-pending' };
+  const c = createHermesController({
+    call: async (name, args) => {
+      calls.push([name, args]);
+      if (name === 'hermes_refresh') return { hermes: { targets: [{ target: pending, supported: true }], selected: null, recoveryTarget: pending, health: 'recoveryRequired' } };
+      return preview;
+    }, confirm: async () => false,
+  });
+  await c.refresh();
+  assert.equal(await c.recoverFromBackup(), false);
+  assert.deepEqual(calls.map(([name]) => name), ['hermes_refresh', 'hermes_preview']);
+});
+
 test('journal-only recovery previews the exact pending target without an owner selection', async () => {
   const calls = [];
   const pending = { ...target, home: '/home/user/.hermes-pending' };
@@ -227,6 +265,22 @@ test('real Hermes page preserves select draft values and keyboard focus on chang
   assert.equal(selects[0].value, JSON.stringify([target.executable, target.home]));
   assert.equal(selects[1].value, 'p-2');
   assert.equal(selects[2].value, 'tenant-a');
+});
+
+test('Restore from backup is a separately labelled, separately gated recovery action', async () => {
+  const dom = makeDom();
+  const recoveryController = { state: { targets: [{ target, supported: true }], selection: null, recoveryTarget: target, health: 'recoveryRequired', testStatus: 'notTested', busy: false }, recover() {}, recoverFromBackup() {}, refresh() {} };
+  dom.main.replaceChildren(...hermesPage({ view: pageView, t: translate, ...dom, controller: recoveryController }));
+  const restore = dom.main.querySelectorAll('button').find((node) => node.textContent === 'Restore from backup');
+  assert.ok(restore, 'the restore action is rendered next to Repair');
+  assert.equal(restore.disabled, false);
+  assert.match(dom.main.textContent, /Restore from backup” replaces the whole configuration file/, 'the page says what each recovery does');
+  const unvalidated = { ...recoveryController, state: { ...recoveryController.state, targets: [{ target, supported: false }] } };
+  dom.main.replaceChildren(...hermesPage({ view: pageView, t: translate, ...dom, controller: unvalidated }));
+  assert.equal(dom.main.querySelectorAll('button').find((node) => node.textContent === 'Restore from backup').disabled, true);
+  const configured = { ...recoveryController, state: { ...recoveryController.state, recoveryTarget: null, health: 'configured' } };
+  dom.main.replaceChildren(...hermesPage({ view: pageView, t: translate, ...dom, controller: configured }));
+  assert.equal(dom.main.querySelectorAll('button').some((node) => node.textContent === 'Restore from backup'), false);
 });
 
 test('Hermes Repair and Remove labels resolve from the locale dictionary', async () => {
